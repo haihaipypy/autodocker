@@ -1,13 +1,13 @@
 # AutoDocker
 
-**Docker 镜像更新监测 · 飞书 / Telegram 确认 · 一键自动重建**
+**Docker 镜像更新监测 · 飞书 / Telegram / 钉钉确认 · 一键自动重建**
 
 [![Release](https://img.shields.io/github/v/release/haihaipypy/autodocker?label=release&color=blue)](https://github.com/haihaipypy/autodocker/releases/latest)
 [![Docker Pulls](https://img.shields.io/docker/pulls/haihaipypy/autodocker)](https://hub.docker.com/r/haihaipypy/autodocker)
 [![License](https://img.shields.io/github/license/haihaipypy/autodocker)](LICENSE)
 [![Go](https://img.shields.io/github/go-mod/go-version/haihaipypy/autodocker)](go.mod)
 
-监测本机容器的镜像有没有新版本，推送到飞书或 Telegram。在聊天里点「立即更新」，服务按原配置重建容器，
+监测本机容器的镜像有没有新版本，推送到飞书、Telegram 或钉钉。在聊天里点「立即更新」，服务按原配置重建容器，
 挂载、端口、网络、环境变量全部保留，失败自动回滚。没人用的镜像也能一键清理。
 
 ![AutoDocker](docs/images/cover.png)
@@ -18,7 +18,7 @@
 
 | 场景 | 传统做法 | AutoDocker |
 | --- | --- | --- |
-| 想知道镜像有没有更新 | 手动 `docker pull` 比对，或装个全自动更新的又不放心 | 定时巡检，发现更新推送到飞书 / Telegram |
+| 想知道镜像有没有更新 | 手动 `docker pull` 比对，或装个全自动更新的又不放心 | 定时巡检，发现更新推送到飞书 / Telegram / 钉钉 |
 | 决定要不要更新 | 登录 NAS / SSH 上去点 | 在聊天消息里点「立即更新」 |
 | 更新容器 | 手写 `docker run`，容易漏掉挂载或环境变量 | 按原配置重建，字段零丢失 |
 | 更新把服务搞挂了 | 手动找回原配置重新起 | 健康检查不通过自动回滚 |
@@ -26,8 +26,9 @@
 
 ## 特性
 
-- **通知渠道可选**：飞书（企业自建应用，长连接收回调）与 Telegram（bot 长轮询），
-  填好凭据的渠道都会收到提醒，可以同时用两个。设置页左栏选渠道，右栏是所选渠道的完整配置流程。
+- **通知渠道可选**：飞书（企业自建应用，长连接收回调）、Telegram（bot 长轮询）、
+  钉钉（企业内部应用，Stream 长连接 + 互动卡片）。填好凭据的渠道都会收到提醒，可以同时用三个。
+  每个渠道有独立开关，关掉只停推送、配置保留。设置页左栏选渠道，右栏是所选渠道的完整配置流程。
 - **容器与镜像分开管理**：容器页看「在跑的东西要不要更新」，镜像页看「磁盘上有什么、能不能清」。
 - **两种检测模式自动判定**：浮动 tag 比摘要；版本号 tag 额外巡检 tag 列表，出现更高版本时提示。
 - **按钮按状态渲染**，不摆灰按钮；检测失败的原因直接写在容器名下方。
@@ -102,7 +103,7 @@ Docker Hub 拉不动时换 GHCR：`ghcr.io/haihaipypy/autodocker:latest`，内�
 
 ![界面](docs/images/ui-dark.png)
 
-定时巡检 → 发现新版本推送到飞书 / Telegram → 点「立即更新」→ 拉镜像、按原配置重建、健康检查
+定时巡检 → 发现新版本推送到飞书 / Telegram / 钉钉 → 点「立即更新」→ 拉镜像、按原配置重建、健康检查
 → 通过则删旧容器，不通过自动回滚。
 
 「可用」列写的是仓库里更高的版本号；没有更高版本号但同一 tag 被重新推送过，写「内容已更新」。
@@ -111,7 +112,8 @@ Docker Hub 拉不动时换 GHCR：`ghcr.io/haihaipypy/autodocker:latest`，内�
 
 ## 通知配置
 
-两个渠道任选其一，都在「设置 → 通知渠道」里配。
+三个渠道任选其一或全用，都在「设置 → 通知渠道」里配。填好凭据的那个渠道测通后开关会自动打开；
+关掉开关只停「推新提醒」，配置一项不动，已发出的卡片也照常回写状态。
 
 ### 飞书
 
@@ -145,6 +147,33 @@ bot 默认读不到群里的普通聊天（成员列表写「无权读取消息�
 
 → [Telegram 配置全流程](docs/telegram.md)
 
+### 钉钉
+
+**同样必须是企业内部应用。群机器人（webhook）只能单向推消息，收不到按钮点击。**
+
+还要认清入口：后台「应用开发」下有个和「**钉钉应用**」并列的「机器人」，那是旧模型，
+钉钉官方已说明「将逐渐退出历史舞台，不要用它来创建」。卡片模板关联、权限、版本发布
+都在「钉钉应用」详情页里，从应用入口建才不用来回绕。
+
+主线是六步：建企业内部应用 → 开机器人能力 → 在卡片平台搭一张模板并**发布**
+（变量名用 `title` / `status` / `body`，按钮回传参数用 `{"action":"update"}` 这类 JSON）
+→ 拿 `卡片模板 ID` 与 `Client ID / Secret` → 用 Stream 长连接订阅卡片回调 → 把机器人拉进群。
+
+机器人那张配置表**除「消息接收模式」外全是必填**：名称、图标（建议 240×240）、
+简介（≤10 字符）、描述（≤200 字符）、消息预览图（png/jpg，≤2M），最后模式选 **Stream**。
+项目自带 `fnos/ICON_256.PNG` 可直接当图标。
+
+三个容易漏的点：卡片**模板必须发布**，草稿态的模板没法投放；
+按钮的回传参数是「一层 JSON 字符串」，写成裸 `update` 是取不到的；
+机器人配置改完要去「版本管理与发布」发新版本，否则群里看到的还是旧信息。
+
+钉钉卡片更新只改数据、不换整条消息，所以点完按钮后按钮会留在卡片上（飞书和 Telegram 是换掉整条）。
+
+会话 ID **必须让机器人在群里收到过一次消息**才有（钉钉没有反查群列表的接口）。
+记下来之后会存进数据库，重启、装新包都不用再 @，只有加新群才需要再来一次。
+
+→ [钉钉配置逐图步骤](docs/dingtalk.md)
+
 ## 安全
 
 - 挂载 `/var/run/docker.sock` 等同于宿主机 root 权限，只在可信内网使用。
@@ -157,7 +186,8 @@ bot 默认读不到群里的普通聊天（成员列表写「无权读取消息�
 
 - 纯 Go 单二进制，前端零构建（`go:embed`），SQLite 用 `modernc.org/sqlite`（免 CGO）。
 - 不依赖 Docker 官方 SDK，直接封装 Engine REST API，`HostConfig` 原样透传。
-- 飞书走 WebSocket 长连接收回调，Telegram 走 bot 长轮询 —— 两者都免公网、免备案、免反向代理。
+- 三个渠道全是长连接：飞书走 WebSocket、Telegram 走 bot 长轮询、钉钉走 Stream ——
+  都免公网、免备案、免反向代理。
 - 注册表加速三层兜底：用户设置 → 守护进程 `registry-mirrors` → 内置默认，只作用于 Docker Hub。
 
 → [技术实现与目录结构](docs/architecture.md)
@@ -178,6 +208,7 @@ MIT，见 [LICENSE](LICENSE)。
 | [install-docker.md](docs/install-docker.md) | Docker / Compose 部署、全部环境变量、本地开发 |
 | [feishu.md](docs/feishu.md) | 飞书自建应用配置全流程（含截图） |
 | [telegram.md](docs/telegram.md) | Telegram bot 配置全流程、收不到消息的排查 |
+| [dingtalk.md](docs/dingtalk.md) | 钉钉企业内部应用、卡片模板、Stream 长连接的配置全流程 |
 | [usage.md](docs/usage.md) | 两个列表的边界、忽略粒度、检测模式、界面 |
 | [architecture.md](docs/architecture.md) | 技术选型、重建保真规则、存储坑位、测试 |
 | [faq.md](docs/faq.md) | 安全须知、已知边界、常见故障排查 |

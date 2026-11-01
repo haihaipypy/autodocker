@@ -122,6 +122,7 @@ type Channel string
 const (
 	ChannelFeishu   Channel = "feishu"
 	ChannelTelegram Channel = "telegram"
+	ChannelDingTalk Channel = "dingtalk"
 )
 
 // Valid 是否是已实现的渠道。
@@ -237,8 +238,18 @@ type Settings struct {
 	RegistryMirror    string `json:"registry_mirror"`
 	RegistryInsecure  bool   `json:"registry_insecure"`
 
-	// 通知渠道（单选）：feishu / telegram。留空按「谁配好了就用谁」自动判定。
+	// 设置页当前打开的那一栏（feishu / telegram / dingtalk），只影响显示哪份表单，
+	// **不决定消息发给谁** —— 填好且开着开关的渠道都会收到。
 	NotifyChannel string `json:"notify_channel"`
+
+	// 每个渠道一个总开关：关掉后配置全部保留，只是不再往这里推新提醒。
+	//
+	// 用指针是为了区分「没设置过」与「显式关闭」：老库升级上来压根没有这几个字段，
+	// 若把缺失一律当 false，用户在升级那一刻就会莫名收不到提醒。
+	// 字段为 nil 时由 LoadSettings 按「凭据齐不齐」推导。
+	FeishuEnabled   *bool `json:"feishu_enabled"`
+	TelegramEnabled *bool `json:"telegram_enabled"`
+	DingTalkEnabled *bool `json:"dingtalk_enabled"`
 
 	// 飞书凭据放在设置里而不是只在环境变量里：应用装好后用户直接进页面填，
 	// 不用回到安装向导；环境变量只作为首次启动的初值。
@@ -253,6 +264,14 @@ type Settings struct {
 	TelegramChatID   string `json:"telegram_chat_id"`
 	TelegramAPIBase  string `json:"telegram_api_base"`
 	TelegramProxy    string `json:"telegram_proxy"`
+
+	// 钉钉：企业内部应用 + Stream 长连接（免公网）+ 互动卡片。
+	// 卡片模板必须先在钉钉卡片平台搭好并发布，代码只填数据、不定义结构。
+	// 会话 ID 由机器人在群里收到消息时自动汇报，不需要手工抄。
+	DingTalkClientID       string `json:"dingtalk_client_id"`
+	DingTalkClientSecret   string `json:"dingtalk_client_secret"`
+	DingTalkCardTemplateID string `json:"dingtalk_card_template_id"`
+	DingTalkConversationID string `json:"dingtalk_conversation_id"`
 
 	// 访问密码同样放在设置里：默认留空即不启用登录。
 	// 本应用能重建任意容器（等同于系统最高权限），只在确实需要时开。

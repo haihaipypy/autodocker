@@ -38,11 +38,17 @@ type Config struct {
 	FeishuUseLongConn       bool
 
 	// 通知渠道与 Telegram
-	NotifyChannel    string // feishu / telegram，留空自动判定
+	NotifyChannel    string // 设置页当前打开的渠道，只影响显示哪份表单
 	TelegramBotToken string
 	TelegramChatID   string
 	TelegramAPIBase  string
 	TelegramProxy    string
+
+	// 钉钉（企业内部应用 + Stream 长连接 + 互动卡片）
+	DingTalkClientID       string
+	DingTalkClientSecret   string
+	DingTalkCardTemplateID string
+	DingTalkConversationID string
 
 	// 更新策略
 	AutoUpdateEnabled bool // 检测到更新后是否无需确认直接更新
@@ -87,6 +93,10 @@ func Load() (*Config, error) {
 		TelegramChatID:          envStr("TELEGRAM_CHAT_ID", ""),
 		TelegramAPIBase:         envStr("TELEGRAM_API_BASE", ""),
 		TelegramProxy:           envStr("TELEGRAM_PROXY", ""),
+		DingTalkClientID:        envStr("DINGTALK_CLIENT_ID", ""),
+		DingTalkClientSecret:    envStr("DINGTALK_CLIENT_SECRET", ""),
+		DingTalkCardTemplateID:  envStr("DINGTALK_CARD_TEMPLATE_ID", ""),
+		DingTalkConversationID:  envStr("DINGTALK_CONVERSATION_ID", ""),
 		AutoUpdateEnabled:       envBool("AUTO_UPDATE", false),
 		RequireConfirm:          envBool("REQUIRE_CONFIRM", true),
 		UpdateTimeout:           time.Duration(envInt("UPDATE_TIMEOUT", 300)) * time.Second,

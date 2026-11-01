@@ -660,6 +660,58 @@ main { padding: 20px 24px 48px; }
 .channel-chip.soon { cursor: not-allowed; opacity: .55; }
 .channel-chip.soon:hover { border-color: var(--border); }
 
+/* 渠道总开关：关掉只停推送，配置一项都不动 —— 文案里要让人看出来这点 */
+.chan-switch {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  margin: 8px 0 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--input-bg);
+}
+.chan-switch .sw-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.chan-switch .sw-title { font-size: 13px; color: var(--text); }
+.chan-switch .sw-sub { font-size: 11px; color: var(--text-sub); }
+
+/* 纯 CSS 开关。不用 color-mix，飞牛的 WebView 未必支持 —— 
+   一旦整条 background 失效，开关会掉成看不出状态的一块灰。 */
+.sw { position: relative; flex: 0 0 40px; width: 40px; height: 22px; }
+.sw input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+  z-index: 1;
+}
+.sw .track {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: var(--border-strong);
+  transition: background .18s ease;
+  pointer-events: none;
+}
+.sw .track::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform .18s ease;
+}
+.sw input:checked + .track { background: var(--accent); }
+.sw input:checked + .track::after { transform: translateX(18px); }
+.sw input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 /* 「读取会话」返回的候选列表 */
 .chat-pick { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
 .chat-pick.empty,

@@ -103,13 +103,16 @@ docker compose up -d --build
 | `ADMIN_USER` | 登录用户名，默认 `admin` |
 | `SELF_CONTAINER` | 自己的容器名，用于阻止「更新自己」。默认 `autodocker`，改了容器名要同步改这里 |
 | `SCAN_INTERVAL` | 巡检间隔秒数，最小 30，`0` 表示只在手动点击时扫描 |
-| `NOTIFY_CHANNEL` | 用哪个通知渠道：`feishu` 或 `telegram`。同上，作为首次启动的初值，之后在网页里选 |
+| `NOTIFY_CHANNEL` | 设置页默认展示哪个渠道的表单：`feishu` / `telegram` / `dingtalk`。**不决定消息发给谁** —— 凭据齐全的渠道都会收到，每个渠道在网页里另有开关 |
 | `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 飞书自建应用凭据。作为**首次启动的初值**，之后在网页「设置」里维护，数据库里的值优先 |
 | `FEISHU_CHAT_ID` | 接收通知的群 ID，同上 |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot 凭据（`@BotFather` 给的 `数字:字母` 串），同上 |
 | `TELEGRAM_CHAT_ID` | 接收消息的会话 ID。群与频道为负数；也可在设置页点「读取会话」自动填 |
 | `TELEGRAM_API_BASE` | Telegram API 地址，留空用 `https://api.telegram.org`。直连不通时填自建反代 |
 | `TELEGRAM_PROXY` | HTTP 代理，形如 `http://192.168.1.2:7890`。走代理上外网时填，留空直连 |
+| `DINGTALK_CLIENT_ID` / `DINGTALK_CLIENT_SECRET` | 钉钉企业内部应用的 Client ID / Secret，同上。Secret **只显示一次** |
+| `DINGTALK_CARD_TEMPLATE_ID` | 卡片平台上已发布模板的 ID（不是模板名称） |
+| `DINGTALK_CONVERSATION_ID` | 接收卡片的群会话 ID，也可在设置页点「读取会话」自动填 |
 | `AUTO_UPDATE` | 发现即自动更新（无人值守）。默认关闭，即「发现 → 通知 → 等人确认」 |
 | `WATCH` | 额外监控本机没有运行的镜像，逗号分隔，例如 `nginx:1.25,redis:7.2` |
 | `ROLLBACK_ON_FAILURE` | 更新失败是否自动回滚，默认 `true` |

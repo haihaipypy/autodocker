@@ -36,7 +36,8 @@ services:
 
       # ---- 通知渠道（默认留空：不填就只是不推通知）----
       # 在网页「设置 → 通知渠道」里选和填，下面这些只作首次启动的初值。
-      # 同一时刻只用一个渠道：feishu / telegram
+      # 凭据齐全的渠道都会收到提醒，可以同时用三个；每个渠道在网页里另有开关。
+      # NOTIFY_CHANNEL 只决定设置页默认展示哪个渠道的表单，不决定发给谁
       # - NOTIFY_CHANNEL=feishu
 
       # ---- 飞书通知 ----
@@ -51,6 +52,14 @@ services:
       # - TELEGRAM_CHAT_ID=
       # 直连 api.telegram.org 不通时填自建反代地址（不带 /bot 后缀）
       # - TELEGRAM_API_BASE=
+
+      # ---- 钉钉通知 ----
+      # 必须是「企业内部应用」，群机器人（webhook）收不到按钮点击。
+      # 卡片模板要先去卡片平台搭好并发布，具体见 docs/dingtalk.md
+      # - DINGTALK_CLIENT_ID=
+      # - DINGTALK_CLIENT_SECRET=
+      # - DINGTALK_CARD_TEMPLATE_ID=
+      # - DINGTALK_CONVERSATION_ID=
 
       # ---- 网页登录（默认留空：不启用登录）----
       # 要让端口离开内网，务必设上密码。

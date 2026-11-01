@@ -17,6 +17,7 @@ internal/updater    容器重建与回滚，以及只拉镜像的更新
 internal/notify     通知路由（渠道选择、回调分发、通用投递记录）
 internal/notify/feishu    飞书卡片与长连接回调
 internal/notify/telegram  Telegram Bot API 客户端、消息与长轮询
+internal/notify/dingtalk  钉钉互动卡片、accessToken 缓存与 Stream 长连接
 internal/api        REST 接口
 web/                前端单页（无需构建，go:embed 进二进制）
 
@@ -52,6 +53,71 @@ Dockerfile          多阶段构建（golang → alpine，纯静态二进制）
 服务只能从「bot 最近收到过消息的会话」里得知 ID —— 这也是配置流程里必须先让它说一句话的原因。
 两个渠道共用 `Notification.Channel` + `MessageID` 与回调状态，
 加新渠道只需实现「发一条带按钮的消息」「改这条消息」「处理一次回调」三件事。
+
+## 通知渠道的分发与开关
+
+**一条提醒广播到所有就绪渠道**，不是挑一个发。用户两个渠道都填好了却只收到一个，
+第一反应是「另一个坏了」，所以 `readyChannels()` 返回候选全集，逐个投递，
+一个失败不连累另一个，只有全部失败才返回 error。
+
+`Notification.Deliveries []Delivery` 记全量投递坐标（`nid` / 渠道 / 会话 / 消息 ID），
+`Channel` / `ChatRef` / `MessageID` 保留第一条作「主投递」，只用于列表展示。
+**少记一条，那个渠道后续的卡片更新就找不到坐标**，消息会永远停在「待更新」。
+
+**每个渠道一个总开关**（`feishu_enabled` / `telegram_enabled` / `dingtalk_enabled`）：
+
+- 关掉只停「推新提醒」，配置项一个都不动 —— 用户的预期是「暂时静音」，不是「清空设置」。
+- **已发出的卡片仍然继续回写状态**。`editDelivery` 刻意不看开关，只看凭据还在不在；
+  否则用户中途关掉渠道，之前那条消息就永远停在「待更新」。
+- 字段类型是 `*bool` 而非 `bool`：要区分「老库升级上来没这个字段」与「用户显式关闭」。
+  为 nil 时按「凭据齐不齐」推导，否则升级那一刻用户会莫名静默。
+- 设置页把「未配置」与「已暂停」分开表述：前者说「待配置」，后者说「已暂停：配置保留，
+  不再推送新提醒」；顶栏状态胶囊同理，关掉全部渠道时写「通知已暂停」而不是「未连接」。
+- 测通后自动打开开关（`enableChannelAfterTest`）—— 用户刚验证完链路，不会想再点一次开关。
+
+## 钉钉的 Stream 与卡片
+
+**企业内部应用 + 机器人 + Stream 长连接 + 互动卡片**。不用群机器人 webhook，
+因为 webhook 只能单向推消息，收不到按钮点击，而「点按钮直接重建」是本项目的核心功能。
+
+Stream 是官方反向 WebSocket：`POST /v1.0/gateway/connections/open` 拿到 `endpoint` + `ticket`
+（90 秒有效、**只能用一次**），然后连 `wss://<endpoint>?ticket=<ticket>`。
+同样免公网、免备案、免反代。几个必须按原样处理的点：
+
+- 帧格式 `{specVersion, type, headers, data}`，`data` 是一层 JSON 字符串。
+  ACK 通过**同一条 WebSocket 回写**（不是 HTTP），`headers.messageId` 必须与请求一致。
+- `SYSTEM/ping` 要把 `data` **原样**回传（opaque，一字不差）；`SYSTEM/disconnect`
+  是服务端负载均衡主动踢线，不响应，但必须用**新 ticket** 重连。
+- 卡片回调的 `content` 是**一层转义的 JSON 字符串**，按钮参数在
+  `content → cardPrivateData → params → action`，少解一层就永远取不到 action。
+- `accessToken` 有效期约 7200 秒，必须缓存（提前 5 分钟刷新）；换 Client ID / Secret 时清缓存。
+- `CreateAndDeliverCard` 的 `callbackType` 必须写 `"STREAM"`（大写），
+  `openSpaceId = dtv1.card//IM_GROUP.<会话 ID>`，`imGroupOpenDeliverModel.robotCode` = Client ID。
+  顶层 `success` 为真不代表投递成功，要逐个检查 `deliverResults[].success`。
+
+**卡片模板在钉钉侧搭，代码只传数据。** 与飞书相反，钉钉不允许代码定义卡片结构：
+必须先在卡片平台建模板、发布、拿 `cardTemplateId`，代码只传 `cardParamMap`。
+变量名硬约定为 `title` / `status` / `body`（`dingtalk.VarTitle` 等），单值上限 1KB，
+`clip()` 按字节截断但保证不切坏多字节字符。**更新卡片只改数据不改结构**，
+所以按钮点完之后会留在卡片上（飞书/Telegram 换的是整条消息）。
+
+**`outTrackId` 兼作通知 ID 的载体。** 飞书能把 `nid` 塞进按钮 `value`，
+钉钉的按钮回传参数由模板定义、代码改不了，所以把 `nid` 编进卡片实例 ID：
+`ad-<nid>-<纳秒>-<序号>`。序号是 `atomic.Uint64` —— 同一纳秒内 `time.Now().UnixNano()`
+可能重复（Windows 时钟精度百纳秒级），撞了会报 `cardAlreadyExist`，
+现象是「发了两条通知只收到一张卡」。
+
+回调进来必须**反向校验**：`hasDingTalkDelivery(n, outTrackID)` 确认这条通知确实投递过这张卡。
+ID 格式是可推导的，不校验等于「任何人构造一个 ID 就能让任意一条历史通知触发容器重建」
+—— 而重建容器等同于系统最高权限。
+
+**会话列表必须落盘。** 钉钉不提供「列出机器人所在群」的接口，会话 ID 只能靠
+`/v1.0/im/bot/messages/get` 随消息带上来 —— 这份列表是不可再生的，只放内存的话
+装个包重启一次就得让用户重新 @ 一次机器人。存 `settings` 表 `dingtalk_chats`（JSON），
+不单开表：一条记录就 `{id,title,last_at}`，加表还得走 `ALTER COLUMN` 那套迁移。
+`AttachChatStore` 时**合并而非覆盖**（本进程刚收的那份比磁盘上的新），
+同一个群**标题跟着更新的那条走** —— 只要非空就覆盖，会让改过名的群一直显示旧名字。
+
 
 **加速地址三层兜底：`用户设置 → 守护进程 registry-mirrors → 内置默认`。**
 默认值刻意**不写进环境变量默认值**，否则中间那层永远进不去。
@@ -128,8 +194,14 @@ Requires Go 1.26+。覆盖的是**本地无法用眼睛验证、出错代价又�
 - `internal/updater` —— 重建配置的还原：镜像引用覆盖、Hostname 处理、匿名卷补齐、
   内置网络剔除、`-v` 表达式里容器内路径的解析；
 - `internal/notify` —— 「点了更新按钮到底去拉哪个镜像」的判定；
+  渠道开关的过滤语义；`outTrackId` 的编解码与唯一性（同一纳秒内不得重复）；
+  会话列表写库再读回的往返（重启后仍可选）与坏数据容错；
 - `internal/notify/feishu` —— 卡片 2.0 结构约束：`schema`、`body.elements`、
   按钮 `behaviors.callback` 及其 `value`；测试卡片的按钮回传载荷；
+- `internal/notify/dingtalk` —— Stream 协议端到端（假网关回放 ping → 卡片回调 →
+  机器人消息 → disconnect 重连，验证 opaque 原样回传、两层 JSON 解析、新 ticket 重连）；
+  投放请求体的场域与 `callbackType`；accessToken 缓存与换凭据清缓存；
+  卡片变量名与 1KB 截断；会话列表跨实例存活与合并（同 ID 取更新的标题与时间）；
 - `internal/scanner` —— 通知标题与正文的措辞（含「不该出现内部术语」的反向断言）；
   以及「忽略本版本」的抑制边界：远端摘要没变就不推、变了照推；
 - `internal/store` —— 首页统计的**口径**必须只数容器，本机镜像与纯远端项不能计入；

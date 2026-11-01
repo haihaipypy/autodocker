@@ -142,6 +142,12 @@ func (s *Server) Handler() http.Handler {
 	// Telegram 链路状态：长轮询是否在跑、最近在哪些会话里收到过消息
 	mux.HandleFunc("GET /api/telegram/status", s.handleTelegramStatus)
 
+	mux.HandleFunc("POST /api/dingtalk/test", s.handleDingTalkTest)
+	// 只验凭据：能不能换到 accessToken，不要求模板与会话
+	mux.HandleFunc("POST /api/dingtalk/check", s.handleDingTalkCheck)
+	// 钉钉链路状态：Stream 是否在跑、机器人在哪些群里收到过消息
+	mux.HandleFunc("GET /api/dingtalk/status", s.handleDingTalkStatus)
+
 	// 注册表连通性诊断：列表里出现「未知」时用来定位到底是哪一环不通
 	mux.HandleFunc("POST /api/registry/test", s.handleRegistryTest)
 

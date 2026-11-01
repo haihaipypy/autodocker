@@ -12,6 +12,7 @@ import (
 
 	"github.com/haihaipypy/autodocker/internal/dockerx"
 	"github.com/haihaipypy/autodocker/internal/model"
+	"github.com/haihaipypy/autodocker/internal/notify/dingtalk"
 	"github.com/haihaipypy/autodocker/internal/notify/telegram"
 	"github.com/haihaipypy/autodocker/internal/registry"
 	"github.com/haihaipypy/autodocker/internal/scanner"
@@ -905,12 +906,73 @@ func (s *Server) handleTelegramStatus(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, resp)
 }
 
-type registryTestReq struct {
-	Reference string `json:"reference"`
+func (s *Server) handleDingTalkTest(w http.ResponseWriter, r *http.Request) {
+	if err := s.nt.SendTestDingTalk(r.Context()); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeOK(w, map[string]any{"result": "sent"})
 }
 
-// handleRegistryTest 逐个探测注册表与各加速源的连通情况。
+// handleDingTalkCheck 只验「凭据对不对、这台机器能不能连上钉钉」。
 //
+// 与 Telegram 的检测同一个用意：「发送测试卡片」必须先有模板与会话才跑得起来，
+// 真正的病因（Client Secret 抄错、出网不通）会被挡在后面，
+// 报出来的却是「还缺卡片模板」—— 人就跑去折腾模板了。
+// 这里只跑一次 accessToken，把凭据与出网两件事一次说清。
+//
+// 请求体可以带覆盖值：刚改完还没保存时也能先试通，省掉「保存→回来看→再改」。
+func (s *Server) handleDingTalkCheck(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ClientID     string `json:"dingtalk_client_id"`
+		ClientSecret string `json:"dingtalk_client_secret"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&in)
+
+	cfg := s.nt.DingTalk().Config()
+	if in.ClientID != "" {
+		cfg.ClientID = in.ClientID
+	}
+	if in.ClientSecret != "" {
+		cfg.ClientSecret = in.ClientSecret
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+
+	if err := dingtalk.New(cfg).Check(ctx); err != nil {
+		writeOK(w, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeOK(w, map[string]any{"ok": true, "apiBase": cfg.APIBase})
+}
+
+func (s *Server) handleDingTalkStatus(w http.ResponseWriter, r *http.Request) {
+	at, action, ch, count := s.nt.CallbackState()
+	dg := s.nt.DingTalk()
+	resp := map[string]any{
+		"configured":       dg.Configured(),
+		"stream":           s.nt.DingTalkStreamRunning(),
+		"conversation_id":  dg.ConversationID(),
+		"card_template_id": dg.CardTemplateID(),
+		// 缺哪几项单独列出来：设置页据此告诉用户「还差什么」，
+		// 而不是笼统地说一句「未配置」。
+		"missing":        dg.MissingForSend(),
+		"chats":          s.nt.DingTalkChats(),
+		"last_error":     s.nt.DingTalkLastError(),
+		"callback_count": count,
+		"last_action":    action,
+		"last_channel":   string(ch),
+	}
+	if !at.IsZero() {
+		resp["last_callback_at"] = at.Format(time.RFC3339)
+	}
+	writeOK(w, resp)
+}
+
+type registryTestReq struct {
+	Reference string `json:"reference"`
+} // handleRegistryTest 逐个探测注册表与各加速源的连通情况。
 // 镜像列表里全是「未知」时，用户只看到三个字，无从下手。
 // 这个接口把「直连通不通、加速站通不通、tag 到底在不在」逐条摆出来，
 // 让排查从「猜」变成「看」。
@@ -990,14 +1052,45 @@ func (s *Server) LoadSettings() model.Settings {
 		TelegramChatID:    s.cfg.TelegramChatID,
 		TelegramAPIBase:   s.cfg.TelegramAPIBase,
 		TelegramProxy:     s.cfg.TelegramProxy,
-		AdminUser:         authUser,
-		AdminPassword:     authPass,
+
+		DingTalkClientID:       s.cfg.DingTalkClientID,
+		DingTalkClientSecret:   s.cfg.DingTalkClientSecret,
+		DingTalkCardTemplateID: s.cfg.DingTalkCardTemplateID,
+		DingTalkConversationID: s.cfg.DingTalkConversationID,
+
+		AdminUser:     authUser,
+		AdminPassword: authPass,
 	}
 	raw, ok, err := s.st.GetSetting(settingsKey)
 	if err == nil && ok && raw != "" {
 		_ = json.Unmarshal([]byte(raw), &out)
 	}
+
+	// 开关字段是后加的，老库里没有。缺失时按「凭据齐不齐」推导 ——
+	// 若一律当成关闭，用户升级到这一版会在毫无提示的情况下收不到任何提醒。
+	feOn := enabledOrDefault(out.FeishuEnabled, feishuReady(out))
+	tgOn := enabledOrDefault(out.TelegramEnabled, out.TelegramBotToken != "" && out.TelegramChatID != "")
+	dtOn := enabledOrDefault(out.DingTalkEnabled, dingtalkReady(out))
+	out.FeishuEnabled, out.TelegramEnabled, out.DingTalkEnabled = &feOn, &tgOn, &dtOn
+
 	return out
+}
+
+// enabledOrDefault 开关没设置过时按「这个渠道配齐了没有」推导。
+func enabledOrDefault(v *bool, configured bool) bool {
+	if v != nil {
+		return *v
+	}
+	return configured
+}
+
+func feishuReady(s model.Settings) bool {
+	return s.FeishuAppID != "" && s.FeishuAppSecret != "" && s.FeishuChatID != ""
+}
+
+func dingtalkReady(s model.Settings) bool {
+	return s.DingTalkClientID != "" && s.DingTalkClientSecret != "" &&
+		s.DingTalkCardTemplateID != "" && s.DingTalkConversationID != ""
 }
 
 func (s *Server) saveSettings(in model.Settings) error {
@@ -1051,4 +1144,17 @@ func (s *Server) ApplySettings(in model.Settings) {
 		APIBase: in.TelegramAPIBase,
 		Proxy:   in.TelegramProxy,
 	})
+	s.nt.ApplyDingTalk(dingtalk.Config{
+		ClientID:       in.DingTalkClientID,
+		ClientSecret:   in.DingTalkClientSecret,
+		CardTemplateID: in.DingTalkCardTemplateID,
+		ConversationID: in.DingTalkConversationID,
+	})
+	// 开关同样按「缺失就按凭据推导」处理：老客户端或脚本 PUT 时不会带这三个字段，
+	// 一律当 false 会把用户正在用的渠道全关掉，而且下次打开页面才看得出来。
+	s.nt.ApplyNotifyEnabled(
+		enabledOrDefault(in.FeishuEnabled, feishuReady(in)),
+		enabledOrDefault(in.TelegramEnabled, in.TelegramBotToken != "" && in.TelegramChatID != ""),
+		enabledOrDefault(in.DingTalkEnabled, dingtalkReady(in)),
+	)
 }

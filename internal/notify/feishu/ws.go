@@ -3,6 +3,7 @@ package feishu
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"sync"
 
@@ -57,7 +58,14 @@ func (l *LongConn) Start(ctx context.Context) error {
 	l.log.Info("飞书卡片交互长连接启动中")
 	err := l.client.Start(ctx)
 	if err != nil {
-		l.log.Error("飞书长连接异常退出", "err", err)
+		// 关停时 ctx 被取消，SDK 把 context canceled 当错误返回来。
+		// 那不是故障 —— 打成 ERROR 等于每次重启都留一条假的「异常」，
+		// 用户按文档来查日志时会被它带偏，真出问题时反而分不清。
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			l.log.Info("飞书长连接已关闭")
+		} else {
+			l.log.Error("飞书长连接异常退出", "err", err)
+		}
 	}
 	return err
 }
