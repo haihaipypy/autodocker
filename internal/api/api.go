@@ -20,6 +20,7 @@ import (
 	"github.com/haihaipypy/autodocker/internal/notify"
 	"github.com/haihaipypy/autodocker/internal/registry"
 	"github.com/haihaipypy/autodocker/internal/scanner"
+	"github.com/haihaipypy/autodocker/internal/selfcheck"
 	"github.com/haihaipypy/autodocker/internal/store"
 	"github.com/haihaipypy/autodocker/internal/updater"
 	"github.com/haihaipypy/autodocker/web"
@@ -34,19 +35,21 @@ type Deps struct {
 	Notify   *notify.Service
 	Registry *registry.Client
 	Docker   *dockerx.Client
+	Self     *selfcheck.Checker
 	Logger   *slog.Logger
 }
 
 // Server HTTP 服务。
 type Server struct {
-	cfg *config.Config
-	st  *store.Store
-	sc  *scanner.Scanner
-	up  *updater.Updater
-	nt  *notify.Service
-	reg *registry.Client
-	dk  *dockerx.Client
-	log *slog.Logger
+	cfg  *config.Config
+	st   *store.Store
+	sc   *scanner.Scanner
+	up   *updater.Updater
+	nt   *notify.Service
+	reg  *registry.Client
+	dk   *dockerx.Client
+	self *selfcheck.Checker
+	log  *slog.Logger
 
 	// 访问密码可以在设置页随时改，所以不能直接读 cfg —— 那是启动时定死的。
 	authMu   sync.RWMutex
@@ -65,14 +68,15 @@ type Server struct {
 // New 构造 HTTP 服务。
 func New(d Deps) *Server {
 	s := &Server{
-		cfg: d.Cfg,
-		st:  d.Store,
-		sc:  d.Scanner,
-		up:  d.Updater,
-		nt:  d.Notify,
-		reg: d.Registry,
-		dk:  d.Docker,
-		log: d.Logger,
+		cfg:  d.Cfg,
+		st:   d.Store,
+		sc:   d.Scanner,
+		up:   d.Updater,
+		nt:   d.Notify,
+		reg:  d.Registry,
+		dk:   d.Docker,
+		self: d.Self,
+		log:  d.Logger,
 	}
 	// 环境变量里的凭据只作首次启动的初值，之后以数据库里的设置为准
 	s.authUser, s.authPass = d.Cfg.AdminUser, d.Cfg.AdminPassword
@@ -150,6 +154,10 @@ func (s *Server) Handler() http.Handler {
 
 	// 注册表连通性诊断：列表里出现「未知」时用来定位到底是哪一环不通
 	mux.HandleFunc("POST /api/registry/test", s.handleRegistryTest)
+
+	// 自检更新：只报告「有没有新版本 + 怎么升」，不会自己动手升级
+	mux.HandleFunc("GET /api/selfcheck", s.handleSelfCheck)
+	mux.HandleFunc("POST /api/selfcheck", s.handleSelfCheckRun)
 
 	mux.Handle("/", s.staticHandler())
 

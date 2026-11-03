@@ -11,7 +11,13 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN go build -trimpath -ldflags="-s -w" -o /out/autodocker ./cmd/server
+
+# 版本号由 CI 按 tag 传进来，编进二进制里给「自检更新」用。
+# 分支构建传 dev —— 拿 sha 当版本号会被当成「1.4.1 这种数字版本」去比大小，结论全是错的。
+ARG VERSION=dev
+RUN go build -trimpath \
+    -ldflags="-s -w -X github.com/haihaipypy/autodocker/internal/selfcheck.Version=${VERSION}" \
+    -o /out/autodocker ./cmd/server
 
 # ---- 运行阶段 ----
 FROM alpine:3.24

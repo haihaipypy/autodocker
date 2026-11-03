@@ -52,13 +52,21 @@ fi
 echo "==> 编译 linux/${GOARCH_VAL}"
 mkdir -p fnos/app/bin
 
+# 版本号从 manifest 取，编进二进制里给「自检更新」用。
+# 两处各写一份迟早会写成不一样 —— 就会出现「应用中心显示 1.5.0、程序自己认为 1.4.0」。
+VERSION="$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' fnos/manifest | head -n 1 | tr -d '[:space:]')"
+[ -z "$VERSION" ] && VERSION=dev
+echo "    版本 ${VERSION}"
+
 # 必须先删掉旧产物，这是个很坑的地方：
 # go build -o 在「目标文件已存在且 build ID 相同」时会直接跳过写入。一旦产物被
 # 外部工具改坏（文件被截断，尾部没了但开头的 build ID 还在），Go 仍认为它是最新的，
 # 坏文件就会一直留着，后面每一步都「成功」但包里装的是跑不起来的二进制。
 rm -f fnos/app/bin/autodocker
 CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH_VAL" \
-    go build -trimpath -ldflags="-s -w" -o fnos/app/bin/autodocker ./cmd/server
+    go build -trimpath \
+    -ldflags="-s -w -X github.com/haihaipypy/autodocker/internal/selfcheck.Version=${VERSION}" \
+    -o fnos/app/bin/autodocker ./cmd/server
 
 echo "==> 校验二进制完整性"
 go run ./tools/elfcheck fnos/app/bin/autodocker

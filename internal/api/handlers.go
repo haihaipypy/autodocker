@@ -16,6 +16,7 @@ import (
 	"github.com/haihaipypy/autodocker/internal/notify/telegram"
 	"github.com/haihaipypy/autodocker/internal/registry"
 	"github.com/haihaipypy/autodocker/internal/scanner"
+	"github.com/haihaipypy/autodocker/internal/selfcheck"
 	"github.com/haihaipypy/autodocker/internal/store"
 	"github.com/haihaipypy/autodocker/internal/updater"
 )
@@ -753,6 +754,30 @@ func (s *Server) handleManualUpdate(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]any{"task_id": taskID})
 }
 
+// handleSelfCheck 返回上一次自检的结果（缓存，不打网络）。
+func (s *Server) handleSelfCheck(w http.ResponseWriter, r *http.Request) {
+	if s.self == nil {
+		writeOK(w, map[string]any{"current": "dev"})
+		return
+	}
+	writeOK(w, s.self.State())
+}
+
+// handleSelfCheckRun 立刻查一次。
+//
+// 只在用户主动点「检查更新」时走到这里，所以请求本身要等网络 ——
+// 直连不通时要依次试几个公共加速，最坏 30 多秒，所以留 40 秒上限；
+// 超时就当这次没查到，不让页面一直转圈。
+func (s *Server) handleSelfCheckRun(w http.ResponseWriter, r *http.Request) {
+	if s.self == nil {
+		writeErr(w, http.StatusServiceUnavailable, "自检未启用")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second)
+	defer cancel()
+	writeOK(w, s.self.Check(ctx, true))
+}
+
 func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, s.LoadSettings())
 }
@@ -776,6 +801,10 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "健康检查等待时间需在 0-600 秒之间")
 		return
 	}
+	// 先把自检的两个连接参数规整好再落库：用户填 github.1day.vip 是常事，
+	// 存原样的话页面上永远显示半截，看不出到底生效没有。
+	in.SelfCheckMirror = selfcheck.NormalizeMirror(in.SelfCheckMirror)
+	in.SelfCheckProxy = strings.TrimSpace(in.SelfCheckProxy)
 	if err := s.saveSettings(in); err != nil {
 		writeErr(w, http.StatusInternalServerError, "保存设置失败: "+err.Error())
 		return
@@ -1060,6 +1089,13 @@ func (s *Server) LoadSettings() model.Settings {
 
 		AdminUser:     authUser,
 		AdminPassword: authPass,
+
+		// 默认开着：老库升级上来没有这个字段，unmarshal 不会覆盖它；
+		// 反过来若默认关闭，用户永远等不到第一次更新提示。
+		CheckUpdates: true,
+
+		// 代理与加速前缀默认留空 —— 留空就是直连，和这一版之前的行为一致。
+		// 国内机器连不上 GitHub 时由用户在设置页自己填，不预置任何第三方地址。
 	}
 	raw, ok, err := s.st.GetSetting(settingsKey)
 	if err == nil && ok && raw != "" {
@@ -1132,6 +1168,14 @@ func (s *Server) ApplySettings(in model.Settings) {
 			Mirrors:  registry.ParseMirrors(mirrors),
 			Insecure: in.RegistryInsecure,
 			Auth:     s.cfg.RegistryAuth,
+		})
+	}
+	// 自检怎么连 GitHub 也在这里下发：用户填完代理点保存，
+	// 下一次「检查更新」就该走代理，而不是等应用重启。
+	if s.self != nil {
+		s.self.Configure(selfcheck.Options{
+			Proxy:  in.SelfCheckProxy,
+			Mirror: in.SelfCheckMirror,
 		})
 	}
 	// 访问密码可以在页面里改：留空即关闭登录，保存后下一个请求就按新凭据校验。

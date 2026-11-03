@@ -98,6 +98,9 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # 只有打 tag 时才有真版本号；分支构建给 dev，自检据此跳过版本比较
+          build-args: |
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
           # 复用上一次构建的层，Go 依赖那层不用每回重下
           cache-from: type=gha
           cache-to: type=gha,mode=max

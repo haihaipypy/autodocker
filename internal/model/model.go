@@ -277,4 +277,18 @@ type Settings struct {
 	// 本应用能重建任意容器（等同于系统最高权限），只在确实需要时开。
 	AdminUser     string `json:"admin_user"`
 	AdminPassword string `json:"admin_password"`
+
+	// CheckUpdates 每天去 GitHub 看一眼自己有没有新版本，只提示、不自动安装。
+	// 关掉就彻底不出网 —— 有些机器在内网，不想有任何多余的外连。
+	CheckUpdates bool `json:"check_updates"`
+
+	// SelfCheckProxy 自检访问 GitHub 时走的代理，形如 http://192.168.1.2:7890
+	// 或 socks5h://192.168.1.2:1080。**通常不用填** —— 直连不通时程序会自动
+	// 换公共加速；填了代理就不再走加速，因为代理更快更稳。
+	SelfCheckProxy string `json:"selfcheck_proxy"`
+
+	// SelfCheckMirror 手动指定 GitHub 加速前缀，形如 https://gh-proxy.com/。
+	// 写法沿用 gh-proxy 系约定：把完整地址直接接在前缀后面。
+	// 留空就用内置的公共加速清单；填了只走这一个，不再自动换。
+	SelfCheckMirror string `json:"selfcheck_mirror"`
 }

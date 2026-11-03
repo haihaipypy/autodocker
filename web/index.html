@@ -64,6 +64,7 @@
   </div>
   <div class="topbar-actions">
     <span id="global-status" class="pill idle">加载中</span>
+    <button id="selfcheck-pill" class="pill update" type="button" hidden>有新版本</button>
     <button id="btn-scan" class="btn primary">立即扫描</button>
     <button id="btn-force" class="btn ghost" title="忽略去重，重新广播全部差异">强制扫描</button>
     <button id="btn-theme" class="btn ghost icon-btn" type="button"
@@ -146,6 +147,17 @@
     </div>
   </section>
 </main>
+
+<div id="update-modal" class="modal" hidden>
+  <div class="modal-mask" data-close-modal="1"></div>
+  <div class="modal-card update-card">
+    <div class="update-head">
+      <h3 id="update-title">发现新版本</h3>
+      <button class="btn ghost small" type="button" data-close-modal="1">关闭</button>
+    </div>
+    <div id="update-body"></div>
+  </div>
+</div>
 
 <div id="clean-modal" class="modal" hidden>
   <div class="modal-mask" data-close-modal="1"></div>

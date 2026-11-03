@@ -21,6 +21,7 @@ import (
 	"github.com/haihaipypy/autodocker/internal/notify/feishu"
 	"github.com/haihaipypy/autodocker/internal/registry"
 	"github.com/haihaipypy/autodocker/internal/scanner"
+	"github.com/haihaipypy/autodocker/internal/selfcheck"
 	"github.com/haihaipypy/autodocker/internal/store"
 	"github.com/haihaipypy/autodocker/internal/updater"
 )
@@ -122,6 +123,9 @@ func run() error {
 
 	nt := notify.New(ctx, fs, st, up, logger)
 
+	// 自检器只查版本、只给步骤，不碰二进制本身（见 internal/selfcheck 的包说明）
+	self := selfcheck.New(logger)
+
 	sc := scanner.New(dk, reg, st, scanner.Options{
 		ExtraWatch:      cfg.Watch,
 		SelfContainer:   cfg.SelfContainer,
@@ -138,6 +142,7 @@ func run() error {
 		Notify:   nt,
 		Registry: reg,
 		Docker:   dk,
+		Self:     self,
 		Logger:   logger,
 	})
 	// 以持久化设置为准（环境变量只作首次启动的初值）。
@@ -155,6 +160,9 @@ func run() error {
 	}
 
 	go scheduler(ctx, sc, srv, logger)
+
+	// 自检每天一次，开关读的是设置页里那一份（改了立即生效，不必重启）
+	go self.Loop(ctx, func() bool { return srv.LoadSettings().CheckUpdates })
 
 	httpSrv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),

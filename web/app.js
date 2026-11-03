@@ -16,6 +16,8 @@ const state = {
   imageSearch: '',
   // 镜像页勾选的镜像 ID。清理是批量操作，靠它决定删哪些。
   picked: new Set(),
+  // 自检结果：当前版本、有没有新版本、更新内容与两套升级步骤
+  self: null,
 };
 
 /* ---------- 登录态 ---------- */
@@ -1061,6 +1063,7 @@ function renderGuide(ch) {
 function renderSettings() {
   const s = state.settings;
   if (!s) return;
+  const selfSt = state.self || {};
   const ch = currentChannel();
   const chName = { feishu: '飞书', telegram: 'Telegram', dingtalk: '钉钉' }[ch] || '飞书';
   const testLabel = ch === 'telegram'
@@ -1143,12 +1146,257 @@ function renderSettings() {
     <p class="field-hint">更新动作始终由人确认：提醒消息里点「立即更新」，或在此页「容器」标签点「更新」。
       环境变量 <code>AUTO_UPDATE=true</code> 可改为发现即更新，该开关不在本页展示，保存设置不会改动它。</p>
 
+    <h3 class="form-section">关于</h3>
+    <div class="about">
+      <div class="about-main">
+        <div class="about-title">AutoDocker <b>${esc(selfSt.current || 'dev')}</b></div>
+        <p class="field-hint" id="about-hint">${esc(aboutHint())}</p>
+      </div>
+      <button type="button" class="btn ghost" id="btn-selfcheck">检查更新</button>
+    </div>
+    <label class="check">
+      <input type="checkbox" id="check_updates" ${s.check_updates ? 'checked' : ''}>
+      每天检查一次新版本（只提示，不会自动升级）
+    </label>
+    <p class="field-hint">
+      更新提示只在页面里显示，不会推到通知渠道。
+      项目地址 <a class="link" href="${esc(selfSt.repo_url || GITHUB_URL)}" target="_blank" rel="noreferrer">${esc(selfSt.repo_url || GITHUB_URL)}</a>
+    </p>
+
+    <div class="selfnet">
+      <p class="field-hint">
+        查版本时会先直连 GitHub，连不上会自动换公共加速（gh-proxy.com 等），
+        <b>两格都留空就能用</b>。只有下面两种情况才需要填。
+      </p>
+      <div class="field">
+        <label for="selfcheck_proxy">代理地址</label>
+        <input id="selfcheck_proxy" name="selfcheck_proxy" type="text" value="${esc(s.selfcheck_proxy || '')}"
+               placeholder="http://192.168.1.2:7890">
+        <p class="field-hint">
+          NAS 上跑着 Clash 之类就填它的端口 —— <code>http://</code> 与 <code>socks5h://</code> 都认。
+          填了就不再走公共加速，因为代理比它快也稳。
+        </p>
+      </div>
+      <div class="field">
+        <label for="selfcheck_mirror">加速前缀</label>
+        <input id="selfcheck_mirror" name="selfcheck_mirror" type="text" value="${esc(s.selfcheck_mirror || '')}"
+               placeholder="https://gh-proxy.com/">
+        <p class="field-hint">
+          只想用某个固定的加速服务时才填，写法是 <code>前缀 + https://github.com/…</code>。
+          填了就一直用它，不再自动换。
+        </p>
+      </div>
+    </div>
+
     <div class="form-actions">
       <button type="submit" class="btn primary">保存设置</button>
     </div>
   `;
 
   renderGuide(ch);
+}
+
+/* ---------- 自检更新 ---------- */
+
+// 后端只负责「告诉你有没有新版本」，升级动作一律由用户自己做：
+// 飞牛包归应用中心，Docker 归 compose。这两个地方都不归本程序管，
+// 替它们动手一旦失败，用户手上就没有能救回来的办法。
+const GITHUB_URL = 'https://github.com/haihaipypy/autodocker';
+
+// 上一次看的是哪一栏（飞牛 / Docker），重开弹窗时沿用
+let updateForm = '';
+// 页面上每个「复制」按钮对应一条命令，按下标取，避免把多行命令塞进 HTML 属性
+let updateCmds = [];
+
+function aboutHint() {
+  const st = state.self || {};
+  // 后端已经把「为什么失败、下一步怎么办」写全了，这里别再套一层
+  if (st.error) return st.error;
+  if (st.dev_build) return '开发构建，不参与版本比较。';
+  // 直连不通时后端会自动走公共加速，把它标出来 —— 出问题时这是第一条线索
+  const via = st.via ? ' · 经 ' + mirrorHost(st.via) + ' 加速' : '';
+  if (st.has_update) return '发现新版本 ' + st.latest + '，顶栏的「有新版本」里有更新内容和升级步骤。';
+  if (st.checked_at) return '已是最新版本 · ' + fmtTime(st.checked_at) + ' 检查' + via;
+  return '还没检查过。';
+}
+
+// mirrorHost 把加速前缀缩成域名，提示里只放这个就够看
+function mirrorHost(u) {
+  return String(u || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
+}
+
+async function loadSelfCheck() {
+  try {
+    state.self = await api('/api/selfcheck');
+  } catch (_) {
+    // 自检只是锦上添花，接口挂了不该影响主界面
+    return;
+  }
+  renderSelfCheckPill();
+  refreshAbout();
+}
+
+// refreshAbout 只改「关于」那两行，不整块重绘设置页 ——
+// 设置页是表单，重绘会把用户还没保存的改动抹掉。
+// 首次打开时设置页比自检结果先渲染出来，版本号会停在 dev，得在这里补一次。
+function refreshAbout() {
+  const ver = document.querySelector('.about-title b');
+  if (ver) ver.textContent = (state.self && state.self.current) || 'dev';
+  const hint = $('#about-hint');
+  if (hint) hint.textContent = aboutHint();
+}
+
+function renderSelfCheckPill() {
+  const el = $('#selfcheck-pill');
+  if (!el) return;
+  const st = state.self || {};
+  // 没新版本就彻底不占位 —— 顶栏已经够挤了
+  el.hidden = !st.has_update;
+  if (!st.has_update) return;
+  el.textContent = '新版本 ' + (st.latest || '');
+  el.title = '当前 ' + (st.current || 'dev') + '，点开看更新内容与升级步骤';
+}
+
+function openUpdateModal() {
+  renderUpdateModal();
+  $('#update-modal').hidden = false;
+}
+
+function closeUpdateModal() {
+  const m = $('#update-modal');
+  if (m) m.hidden = true;
+}
+
+// noteLineHtml 把 Release 正文的一行渲染成弹窗里的一行。
+// 只认 `#` 小标题、`-` 列表、`**加粗**`、反引号 —— 够用，犯不上为这点东西引个 markdown 库。
+function noteLineHtml(line) {
+  let s = String(line || '').trim();
+  let cls = 'note-p';
+  if (/^#{1,6}\s/.test(s)) {
+    cls = 'note-h';
+    s = s.replace(/^#{1,6}\s*/, '');
+  } else if (/^[-*]\s/.test(s)) {
+    cls = 'note-li';
+    s = s.replace(/^[-*]\s*/, '');
+  } else if (/^>\s?/.test(s)) {
+    cls = 'note-quote';
+    s = s.replace(/^>\s?/, '');
+  }
+  let html = esc(s);
+  html = html.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  return `<div class="${cls}">${html}</div>`;
+}
+
+function currentGuide() {
+  const st = state.self || {};
+  const list = st.guides || [];
+  if (!list.length) return null;
+  const want = updateForm || st.deploy_form || '';
+  return list.find((g) => g.key === want) || list[0];
+}
+
+function renderUpdateModal() {
+  const st = state.self || {};
+  const body = $('#update-body');
+  if (!body) return;
+
+  const title = $('#update-title');
+  if (title) title.textContent = st.has_update ? '发现新版本' : '版本信息';
+
+  const list = st.guides || [];
+  const active = currentGuide();
+  updateCmds = [];
+
+  const versions = st.latest
+    ? `<div class="update-versions">
+         <span class="ver">当前 ${esc(st.current || 'dev')}</span>
+         <span class="ver-arrow">→</span>
+         <span class="ver new">最新 ${esc(st.latest)}</span>
+         <span class="hint">${st.checked_at ? esc(fmtTime(st.checked_at)) + ' 检查' : ''}</span>
+       </div>`
+    : `<p class="field-hint">${esc(st.error || '还没查到最新版本')}</p>`;
+
+  const notes = (st.notes || []).length
+    ? `<div class="notes">${st.notes.map(noteLineHtml).join('')}</div>`
+    : `<p class="field-hint">这次没拿到 Release 说明，完整内容见 <a class="link" href="${esc(st.release_url || GITHUB_URL + '/releases')}" target="_blank" rel="noreferrer">发布页</a>。</p>`;
+
+  const tabs = list.length > 1
+    ? `<div class="update-tabs">${list.map((g) => `
+        <button type="button" class="update-tab${active && g.key === active.key ? ' active' : ''}" data-form="${esc(g.key)}">${esc(g.title)}</button>`).join('')}
+      </div>`
+    : '';
+
+  const steps = (active && active.steps) || [];
+  const stepsHtml = steps.map((step, i) => {
+    let cmd = '';
+    if (step.cmd) {
+      const idx = updateCmds.push(step.cmd) - 1;
+      cmd = `<div class="cmd">
+               <pre>${esc(step.cmd)}</pre>
+               <button type="button" class="btn ghost small" data-copy="${idx}">复制</button>
+             </div>`;
+    }
+    return `<li><span class="step-no">${i + 1}</span><div class="step-body"><span>${esc(step.text)}</span>${cmd}</div></li>`;
+  }).join('');
+
+  body.innerHTML = `
+    ${versions}
+    <h4 class="update-sub">更新内容</h4>
+    ${notes}
+    <h4 class="update-sub">怎么升级</h4>
+    <p class="field-hint">${esc(active ? active.hint : '')}</p>
+    ${tabs}
+    <ol class="steps">${stepsHtml}</ol>
+    <div class="update-links">
+      <a class="link" href="${esc(st.repo_url || GITHUB_URL)}" target="_blank" rel="noreferrer">项目地址</a>
+      <a class="link" href="${esc(st.release_url || GITHUB_URL + '/releases')}" target="_blank" rel="noreferrer">Release 页</a>
+    </div>
+  `;
+}
+
+// copyText 复制命令。http 页面没有安全上下文，navigator.clipboard 用不了，
+// 退回 textarea + execCommand —— 局域网里访问 NAS 基本都是 http，这条退路是主路。
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) { /* 落到下面的老办法 */ }
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
+  ta.remove();
+  return ok;
+}
+
+async function runSelfCheck() {
+  const btn = $('#btn-selfcheck');
+  const label = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '检查中…'; }
+  try {
+    state.self = await api('/api/selfcheck', { method: 'POST' });
+    renderSelfCheckPill();
+    refreshAbout();
+    // 手动点检查就一定要给个结果：新版本弹「发现新版本」，已经最新弹「版本信息」。
+    // 只弹 toast 的话，用户看不到更新内容与升级步骤，等于只回答了一半问题。
+    openUpdateModal();
+    if (state.self.has_update) {
+      toast('发现新版本 ' + state.self.latest);
+    } else if (state.self.error) {
+      toast(state.self.error, 'warn');
+    } else {
+      toast('已是最新版本');
+    }
+  } catch (e) {
+    toast('检查失败：' + e.message, 'danger');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = label || '检查更新'; }
+  }
 }
 
 /* ---------- 数据加载 ---------- */
@@ -1193,7 +1441,7 @@ async function loadSettings() {
 async function refresh(opts) {
   const quiet = !!(opts && opts.quiet);
   try {
-    await Promise.all([loadStats(), loadContainers(), loadImages(), loadTasks(), loadNotifications()]);
+    await Promise.all([loadStats(), loadContainers(), loadImages(), loadTasks(), loadNotifications(), loadSelfCheck()]);
   } catch (e) {
     // 轮询触发的刷新失败不提示：局域网抖一下是常事，下一轮自己会好，
     // 每隔几秒弹一次红条反而比数据旧一会儿更烦人。
@@ -1460,6 +1708,11 @@ function settingsPayload() {
     telegram_enabled: channelEnabledState('telegram'),
     dingtalk_enabled: channelEnabledState('dingtalk'),
     registry_mirror: $('#registry_mirror').value.trim(),
+    // 自检开关每次都要带上，否则保存一次设置就把用户关掉的检查又打开了
+    check_updates: $('#check_updates') ? $('#check_updates').checked : true,
+    // 这两个也是「留空即直连」，所以空串要如实回传，不能丢字段
+    selfcheck_proxy: ($('#selfcheck_proxy') ? $('#selfcheck_proxy').value : '').trim(),
+    selfcheck_mirror: ($('#selfcheck_mirror') ? $('#selfcheck_mirror').value : '').trim(),
     admin_user: ($('#admin_user').value || '').trim(),
     admin_password: $('#admin_password').value || '',
     rollback_on_failure: $('#rollback_on_failure').checked,
@@ -1504,7 +1757,32 @@ async function saveSettings(ev) {
   renderSettings();
 
   const mirrorChanged = (prev.registry_mirror || '') !== payload.registry_mirror;
+  // 代理/前缀刚改完，用户要的就是「检查更新能不能通」。顺手在后台试一次，
+  // 免得他保存完还得多点一下才知道填对没填对。
+  const netChanged = (prev.selfcheck_proxy || '') !== payload.selfcheck_proxy
+    || (prev.selfcheck_mirror || '') !== payload.selfcheck_mirror;
+  if (netChanged) {
+    reconnectSelfCheck();
+    toast(mirrorChanged ? '已保存，加速地址已生效，点「立即扫描」验证' : '已保存，正在用新配置试一次检查更新…');
+    return;
+  }
   toast(mirrorChanged ? '已保存，加速地址已生效，点「立即扫描」验证' : '设置已保存并生效');
+}
+
+// reconnectSelfCheck 换了 GitHub 连接方式后静默试一次，结果落在「关于」那一行。
+async function reconnectSelfCheck() {
+  try {
+    state.self = await api('/api/selfcheck', { method: 'POST' });
+  } catch (_) {
+    return;
+  }
+  renderSelfCheckPill();
+  refreshAbout();
+  if (state.self.error) {
+    toast(state.self.error, 'warn');
+  } else {
+    toast(state.self.has_update ? '已保存，发现新版本 ' + state.self.latest : '已保存，检查更新正常');
+  }
 }
 
 // notifyStatusURL 各渠道的链路状态地址。
@@ -1979,6 +2257,7 @@ document.addEventListener('click', async (ev) => {
 
   if (ev.target.closest('[data-close-modal]')) {
     closeCleanModal();
+    closeUpdateModal();
     return;
   }
 
@@ -2052,6 +2331,26 @@ document.addEventListener('click', async (ev) => {
     return;
   }
 
+  // 升级步骤里的命令：按 data-copy 下标取原文，不从 DOM 里回读 —— pre 里带换行，
+  // textContent 取回来会被浏览器规整过，粘出去就变形了
+  const copyBtn = ev.target.closest('button[data-copy]');
+  if (copyBtn) {
+    const text = updateCmds[Number(copyBtn.dataset.copy)];
+    if (text) {
+      copyText(text).then((ok) => toast(ok ? '已复制' : '复制失败，请手动选中命令', ok ? 'ok' : 'warn'));
+    }
+    return;
+  }
+
+  const upTab = ev.target.closest('.update-tab[data-form]');
+  if (upTab) {
+    updateForm = upTab.dataset.form;
+    renderUpdateModal();
+    return;
+  }
+
+  if (ev.target.id === 'selfcheck-pill') openUpdateModal();
+  if (ev.target.id === 'btn-selfcheck') runSelfCheck();
   if (ev.target.id === 'btn-scan') doScan(false);
   if (ev.target.id === 'btn-force') doScan(true);
   if (ev.target.id === 'btn-test-notify') testNotify();
