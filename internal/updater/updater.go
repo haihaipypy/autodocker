@@ -21,6 +21,7 @@ import (
 	"github.com/haihaipypy/autodocker/internal/dockerx"
 	"github.com/haihaipypy/autodocker/internal/model"
 	"github.com/haihaipypy/autodocker/internal/store"
+	"github.com/haihaipypy/autodocker/internal/version"
 )
 
 // Options 更新行为配置。
@@ -125,24 +126,39 @@ func (u *Updater) Run(ctx context.Context, req Request) error {
 	}
 
 	// 自我保护：绝不能更新自己，否则进程被杀、任务中断
-	if req.ContainerName == opt.SelfContainer ||
-		(opt.SelfContainerID != "" && strings.HasPrefix(req.ContainerID, opt.SelfContainerID)) {
+	if req.ContainerName == opt.SelfContainer {
 		logf("已阻止：目标 %s 是本服务自身", req.ContainerName)
 		return fail(errors.New("拒绝更新自身容器"))
 	}
 
-	insp, err := u.dk.InspectContainer(ctx, req.ContainerID)
+	// 拿真正要动的容器。库里记的编号可能已经失效，按名字也能找回来。
+	insp, cid, err := u.resolveContainer(ctx, req)
 	if err != nil {
 		return fail(err)
+	}
+	if opt.SelfContainerID != "" && strings.HasPrefix(cid, opt.SelfContainerID) {
+		logf("已阻止：目标 %s 是本服务自身", req.ContainerName)
+		return fail(errors.New("拒绝更新自身容器"))
 	}
 	if len(insp.Config) == 0 || len(insp.HostConfig) == 0 {
 		return fail(errors.New("容器配置不完整，无法安全重建"))
 	}
 
-	origName := insp.Name
+	origName := strings.TrimPrefix(insp.Name, "/")
 	if origName == "" {
 		origName = req.ContainerName
 	}
+
+	if cid != req.ContainerID {
+		// 顺手把库里那一行挂回真容器，否则下一次点更新还是同一个 404。
+		if img, ferr := u.st.FindImageByContainer(req.ContainerID); ferr == nil {
+			if uerr := u.st.UpdateImageContainer(img.ID, cid, origName); uerr != nil {
+				u.log.Warn("修正监控项容器编号失败", "id", img.ID, "err", uerr)
+			}
+		}
+		req.ContainerID = cid
+	}
+
 	wasRunning := insp.State != nil && insp.State.Running
 	stateText := ""
 	if insp.State != nil {
@@ -177,6 +193,17 @@ func (u *Updater) Run(ctx context.Context, req Request) error {
 		return fail(err)
 	}
 	logf("镜像拉取完成")
+
+	// 容器已经在跑目标镜像：重建只是白停一次服务、白断一次连接。
+	// 正常路径走不到这里，只有「上次重建成功但状态没写回」这类历史数据会撞上 ——
+	// 那时点更新，容器其实早就是新版了。比的是镜像编号，不是引用字符串：
+	// 「同一个 tag 内容变了」正是这个工具要抓的场景，只比引用会把真更新误判成已最新。
+	if sameImageID(insp.Image, u.imageIDForRef(ctx, req.ImageRef)) {
+		logf("容器已运行在 %s 上，无需重建，只刷新监控项", req.ImageRef)
+		u.refreshMonitor(ctx, req, req.ContainerID, origName)
+		_ = u.st.FinishTask(req.TaskID, model.TaskSuccess, req.ContainerID, "")
+		return nil
+	}
 
 	// 停旧容器，腾出容器名与端口
 	if wasRunning {
@@ -238,20 +265,154 @@ func (u *Updater) Run(ctx context.Context, req Request) error {
 	}
 	logf("更新完成：%s 已运行在新镜像上", origName)
 
-	// 刷新镜像记录的本地观测值：容器 ID 已变，摘要也应以新镜像为准
-	if img, ferr := u.st.FindImage(req.ImageRef, req.ContainerID); ferr == nil {
-		localDigest := img.LocalDigest
-		if newInsp, ierr := u.dk.InspectContainer(ctx, newID); ierr == nil {
-			if _, d, derr := u.dk.DigestForImage(ctx, newInsp.Image, req.ImageRef); derr == nil && d != "" {
-				localDigest = d
-			}
-		}
-		_ = u.st.UpdateImageLocal(img.ID, newID, origName, localDigest, tagOf(req.ImageRef))
-		_ = u.st.UpdateImageCheck(img.ID, model.StatusUpToDate, localDigest, "", nil, img.Mode, "")
-	}
+	// 刷新监控项：容器号变了，引用也可能变（v3.6.0 → v3.7.0 这类升 tag 的重建）。
+	u.refreshMonitor(ctx, req, newID, origName)
 
 	_ = u.st.FinishTask(req.TaskID, model.TaskSuccess, newID, "")
 	return nil
+}
+
+// resolveContainer 找到这次真正要更新的容器，返回详情与它当前的编号。
+//
+// 库里记的容器编号会过期：重建成功却没把新编号写回（1.5.7 之前的表现），
+// 或者容器被删掉后重新建了一个同名的。编号每次 create 都变，容器名在重建时
+// 是刻意保留的 —— 所以编号查不到时按名字找回来。
+// 少了这一步，那条记录会永久卡在「更新失败：No such container」，
+// 用户唯一的出路是删掉监控项重加，历史一起丢。
+func (u *Updater) resolveContainer(ctx context.Context, req Request) (*dockerx.Inspect, string, error) {
+	insp, err := u.dk.InspectContainer(ctx, req.ContainerID)
+	if err == nil {
+		return insp, req.ContainerID, nil
+	}
+	if !dockerx.IsNotFound(err) || req.ContainerName == "" {
+		return nil, "", err
+	}
+
+	containers, lerr := u.dk.ListContainers(ctx)
+	if lerr != nil {
+		return nil, "", err
+	}
+	want := strings.TrimPrefix(req.ContainerName, "/")
+	for _, c := range containers {
+		if c.Name != want {
+			continue
+		}
+		found, ierr := u.dk.InspectContainer(ctx, c.ID)
+		if ierr != nil {
+			continue
+		}
+		u.log.Warn("监控项记录的容器编号已失效，按容器名找回",
+			"container", want, "stale_id", shortID(req.ContainerID), "current_id", shortID(c.ID))
+		return found, c.ID, nil
+	}
+
+	return nil, "", fmt.Errorf("容器 %s 已不存在（记录里的编号 %s 也查不到），可能已被删除；请在容器列表里重新添加监控",
+		want, shortID(req.ContainerID))
+}
+
+// sameImageID 两个镜像编号是否指向同一份内容。
+func sameImageID(a, b string) bool {
+	return a != "" && b != "" &&
+		strings.TrimPrefix(a, "sha256:") == strings.TrimPrefix(b, "sha256:")
+}
+
+// normalizeRef 把镜像引用归一成可比较的形式：去掉 Docker Hub 的几种写法差异，补齐默认 tag。
+func normalizeRef(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if ref == "" || strings.Contains(ref, "@") {
+		return ref
+	}
+	ref = strings.TrimPrefix(ref, "docker.io/library/")
+	ref = strings.TrimPrefix(ref, "docker.io/")
+	ref = strings.TrimPrefix(ref, "index.docker.io/")
+	ref = strings.TrimPrefix(ref, "registry-1.docker.io/")
+	ref = strings.TrimPrefix(ref, "library/")
+	slash := strings.LastIndex(ref, "/")
+	colon := strings.LastIndex(ref, ":")
+	if colon <= slash {
+		ref += ":latest"
+	}
+	return ref
+}
+
+// imageIDForRef 本机这个引用当前指向的镜像编号，找不到返回空串。
+func (u *Updater) imageIDForRef(ctx context.Context, ref string) string {
+	images, err := u.dk.ListImages(ctx)
+	if err != nil {
+		return ""
+	}
+	want := normalizeRef(ref)
+	for _, img := range images {
+		for _, t := range img.Tags {
+			if normalizeRef(t) == want {
+				return img.ID
+			}
+		}
+	}
+	return ""
+}
+
+// rebuildStatus 重建完成后这条监控项该是什么状态。
+//
+// 关键在「别替用户把真实存在的更新藏起来」：只重拉了老 tag 的内容（升 tag 没成功、
+// 或者调用的还是旧目标）时，仓库里那个更高的版本仍然在，状态必须留在「可更新」。
+// 无脑写「已最新」的后果是页面安静一小时，下一轮扫描又翻出来 —— 看起来像在抽风。
+// 用 Compare 而不是 SameVersion：3.7 与 v3.7.0 是同一个版本，
+// SameVersion 会因为数字段个数不同判成不一样，于是刚升完就被标回「可更新」。
+func rebuildStatus(tag, latestTag string) (model.Status, string) {
+	if latestTag != "" && version.Compare(tag, latestTag) < 0 {
+		return model.StatusNewTag, latestTag
+	}
+	return model.StatusUpToDate, ""
+}
+
+// refreshMonitor 把监控项对齐到刚重建出来的新容器。
+//
+// 三件事必须一起做，少一件页面就会说谎：
+//   - container_id 换成新容器，否则下一轮扫描按旧号找不到它，会多插一条重复记录；
+//   - reference / local_tag 换成这次重建实际用的引用 —— 升 tag 的重建里引用是变的，
+//     只改 local_tag 不改 reference，页面上的「当前」也还是旧版本；
+//   - 状态按新 tag 重新判定：升到了仓库里那个更高版本才算「已最新」，
+//     只重拉了老 tag 的内容就还得继续显示「可更新」。
+//
+// 查找一律先按容器号：按 (引用, 容器号) 精确查在升 tag 之后必然扑空，
+// 而扑空的后果是整段刷新被跳过 —— 卡片显示「更新成功」，页面却停在旧版本 +「可更新」。
+func (u *Updater) refreshMonitor(ctx context.Context, req Request, newID, name string) {
+	tag := tagOf(req.ImageRef)
+
+	img, err := u.st.FindImageByContainer(req.ContainerID)
+	if err != nil {
+		alt, aerr := u.st.FindImage(req.ImageRef, req.ContainerID)
+		if aerr != nil {
+			u.log.Warn("重建成功，但找不到对应的监控项，状态未能刷新",
+				"container", req.ContainerName, "container_id", req.ContainerID,
+				"ref", req.ImageRef, "err", aerr)
+			return
+		}
+		img = alt
+	}
+
+	imageID := ""
+	localDigest := img.LocalDigest
+	if insp, ierr := u.dk.InspectContainer(ctx, newID); ierr == nil {
+		imageID = insp.Image
+		if _, d, derr := u.dk.DigestForImage(ctx, insp.Image, req.ImageRef); derr == nil && d != "" {
+			localDigest = d
+		}
+	}
+
+	status, latest := rebuildStatus(tag, img.LatestTag)
+
+	if err := u.st.UpdateImageAfterRebuild(img.ID, req.ImageRef, imageID, newID, name, localDigest, tag); err != nil {
+		u.log.Warn("刷新监控项失败", "id", img.ID, "ref", req.ImageRef, "err", err)
+		return
+	}
+	if err := u.st.UpdateImageCheck(img.ID, status, localDigest, latest, img.Aliases, img.Mode, ""); err != nil {
+		u.log.Warn("刷新检测状态失败", "id", img.ID, "err", err)
+		return
+	}
+	u.log.Info("已刷新监控项", "container", name, "ref", req.ImageRef,
+		"tag", tag, "status", string(status), "latest_tag", latest)
 }
 
 // Pull 只把镜像拉到本地，不碰任何容器。

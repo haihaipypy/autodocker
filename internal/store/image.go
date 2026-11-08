@@ -173,6 +173,57 @@ func (s *Store) FindImage(reference, containerID string) (*model.Image, error) {
 	return &img, nil
 }
 
+// FindImageByContainer 按容器 ID 找监控项，不看引用。
+//
+// 为什么不总是用 (reference, container_id) 精确查：重建到更高版本 tag 之后，
+// 这一行的 reference 还是旧的（v3.6.0），而调用方手里拿的是新的（v3.7.0），
+// 精确查必然扑空 —— 扑空的表现不是报错，而是「更新成功但页面停在旧版本」。
+func (s *Store) FindImageByContainer(containerID string) (*model.Image, error) {
+	if containerID == "" {
+		return nil, ErrNotFound
+	}
+	img, err := scanImage(s.db.QueryRow(
+		`SELECT `+imageCols+` FROM images WHERE container_id = ? ORDER BY id DESC LIMIT 1`,
+		containerID,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &img, nil
+}
+
+// UpdateImageAfterRebuild 重建成功后，把监控项对齐到新容器与新的镜像引用。
+//
+// 与「只刷新本地观测值」的写法相比，它同时改 reference 和 image_id：升 tag 的重建里
+// 这两项都是变的，只改 local_tag 会让「当前」一栏永远停在旧版本。
+func (s *Store) UpdateImageAfterRebuild(id int64, reference, imageID, containerID, containerName, localDigest, localTag string) error {
+	_, err := s.db.Exec(`
+		UPDATE images SET reference = ?, image_id = ?, container_id = ?, container_name = ?,
+			local_digest = ?, local_tag = ?, updated_at = ?
+		WHERE id = ?`,
+		reference, imageID, containerID, containerName, localDigest, localTag,
+		timeToTs(time.Now()), id,
+	)
+	return err
+}
+
+// UpdateImageContainer 把监控项挂到另一个容器编号上，引用不动。
+//
+// 用途只有一个：库里记的容器号已经失效，但容器本身还在（重建成功却没写回状态、
+// 或者容器被删掉后重新建了一个同名的）。容器名是稳定的，编号不是。
+// 不修这一列，下一次更新还会拿着旧编号去查，继续 404。
+func (s *Store) UpdateImageContainer(id int64, containerID, containerName string) error {
+	_, err := s.db.Exec(`
+		UPDATE images SET container_id = ?, container_name = ?, updated_at = ?
+		WHERE id = ?`,
+		containerID, containerName, timeToTs(time.Now()), id,
+	)
+	return err
+}
+
 // ListImages 返回监控项，有更新的排在前面。
 //
 // 不传 origins 就是全部；传了就只返回这些来源的记录 ——
@@ -281,16 +332,6 @@ func (s *Store) UpdateImageCheck(id int64, status model.Status, remoteDigest, la
 		WHERE id = ?`,
 		string(status), remoteDigest, latestTag, string(aliasesJSON), errMsg,
 		string(mode), timeToTs(now), timeToTs(now), id,
-	)
-	return err
-}
-
-// UpdateImageLocal 刷新本地镜像观测值（本地 digest / tag 可能随容器重建变化）。
-func (s *Store) UpdateImageLocal(id int64, containerID, containerName, localDigest, localTag string) error {
-	_, err := s.db.Exec(`
-		UPDATE images SET container_id = ?, container_name = ?, local_digest = ?, local_tag = ?, updated_at = ?
-		WHERE id = ?`,
-		containerID, containerName, localDigest, localTag, timeToTs(time.Now()), id,
 	)
 	return err
 }

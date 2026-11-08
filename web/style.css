@@ -630,7 +630,7 @@ main { padding: 20px 24px 48px; }
 .input-row input { flex: 1 1 auto; min-width: 0; }
 .input-row .btn { flex: 0 0 auto; white-space: nowrap; }
 
-/* 通知渠道选择器：已支持的能点，未支持的灰掉标「施工中」 */
+/* 通知渠道选择器：四个渠道都能点，不再有灰掉的占位项 */
 .channel-picker {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(116px, 1fr));
@@ -656,9 +656,6 @@ main { padding: 20px 24px 48px; }
 .channel-chip:hover { border-color: var(--border-strong); }
 .channel-chip.active { border-color: var(--accent); background: var(--accent-soft); }
 .channel-chip.active .chip-sub { color: var(--accent); }
-/* 未支持的渠道不用 disabled 属性，靠这个类即可：仍然可读，但点了没反应 */
-.channel-chip.soon { cursor: not-allowed; opacity: .55; }
-.channel-chip.soon:hover { border-color: var(--border); }
 
 /* 渠道总开关：关掉只停推送，配置一项都不动 —— 文案里要让人看出来这点 */
 .chan-switch {

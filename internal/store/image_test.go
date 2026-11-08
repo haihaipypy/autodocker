@@ -201,3 +201,101 @@ func TestIgnoredDigestSurvivesUpsertAndClearsOnRestore(t *testing.T) {
 		t.Errorf("恢复监控后 ignored 应为 false")
 	}
 }
+
+// 升 tag 重建之后，这一行的引用是**旧的**，容器号是**新的**。
+//
+// 谁在这个时刻还用 (新引用, 旧容器号) 去查，必然扑空 —— 而扑空不会报错，
+// 只会让「更新成功后刷新状态」整段被跳过，页面永远停在
+// 「当前 v3.6.0 / 可更新 v3.7.0」。所以按容器号查这条路径必须存在。
+func TestFindImageByContainerAfterTagUpgrade(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("打开测试库失败: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	img := &model.Image{
+		Reference:     "gdy666/lucky:v3.6.0",
+		ContainerID:   "old-cid",
+		ContainerName: "lucky",
+		Origin:        model.OriginContainer,
+		LocalTag:      "v3.6.0",
+		LatestTag:     "v3.7.0",
+		Status:        model.StatusNewTag,
+		Mode:          model.ModeAuto,
+	}
+	id, err := s.UpsertImage(img)
+	if err != nil {
+		t.Fatalf("写入监控项失败: %v", err)
+	}
+
+	// 精确查（新引用 + 旧容器号）扑空：这正是原来的写法，也是这个 bug 的成因。
+	if _, err := s.FindImage("gdy666/lucky:v3.7.0", "old-cid"); err == nil {
+		t.Fatal("新引用配旧容器号本不该查到，查到说明唯一键变了")
+	}
+	got, err := s.FindImageByContainer("old-cid")
+	if err != nil {
+		t.Fatalf("按容器号应查到：%v", err)
+	}
+	if got.ID != id {
+		t.Fatalf("按容器号查到的是另一行：%d != %d", got.ID, id)
+	}
+
+	// 重建完成后对齐：引用、本地 tag、容器号一起换。
+	if err := s.UpdateImageAfterRebuild(id, "gdy666/lucky:v3.7.0", "sha256:new",
+		"new-cid", "lucky", "sha256:newdigest", "v3.7.0"); err != nil {
+		t.Fatalf("对齐监控项失败: %v", err)
+	}
+	after, err := s.FindImageByContainer("new-cid")
+	if err != nil {
+		t.Fatalf("新容器号应能查到：%v", err)
+	}
+	if after.Reference != "gdy666/lucky:v3.7.0" || after.LocalTag != "v3.7.0" {
+		t.Fatalf("引用与本地 tag 没跟上，得到 %s / %s", after.Reference, after.LocalTag)
+	}
+	// 下一轮扫描就是按 (容器当前镜像, 容器号) 找，必须能命中同一行，
+	// 否则会多插一条记录，列表里同一个容器出现两次。
+	if _, err := s.FindImage("gdy666/lucky:v3.7.0", "new-cid"); err != nil {
+		t.Fatalf("下一轮扫描应命中同一行：%v", err)
+	}
+}
+
+// 容器编号失效后，那一行必须能被重新挂到真容器上。
+//
+// 场景：某次重建成功却没把新编号写回（1.5.7 之前），库里留着的是已经被删掉的
+// 容器编号。之后每次点更新都拿着死编号去 inspect，一律 404，用户只能删掉监控项
+// 重加、历史一起丢。修好这一列，下一次就能正常更新。
+func TestUpdateImageContainerRemapsStaleID(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("打开测试库失败: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	id, err := s.UpsertImage(&model.Image{
+		Reference:     "gdy666/lucky:v3.6.0",
+		ContainerID:   "dead-cid",
+		ContainerName: "lucky",
+		Origin:        model.OriginContainer,
+		LocalTag:      "v3.6.0",
+		Status:        model.StatusNewTag,
+	})
+	if err != nil {
+		t.Fatalf("写入监控项失败: %v", err)
+	}
+
+	if err := s.UpdateImageContainer(id, "live-cid", "lucky"); err != nil {
+		t.Fatalf("重挂容器编号失败: %v", err)
+	}
+
+	if _, err := s.FindImageByContainer("dead-cid"); err == nil {
+		t.Fatal("旧编号不该再查得到")
+	}
+	got, err := s.FindImageByContainer("live-cid")
+	if err != nil {
+		t.Fatalf("新编号应查得到：%v", err)
+	}
+	if got.ID != id || got.Reference != "gdy666/lucky:v3.6.0" {
+		t.Fatalf("重挂后不该动引用，得到 id=%d ref=%s", got.ID, got.Reference)
+	}
+}

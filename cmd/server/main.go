@@ -182,6 +182,7 @@ func run() error {
 	}()
 
 	logger.Info("AutoDocker 已启动",
+		"version", selfcheck.Version,
 		"port", cfg.Port,
 		"scan_interval", cfg.ScanInterval.String(),
 		"feishu_ready", fs.Configured(),

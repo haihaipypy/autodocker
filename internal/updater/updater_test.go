@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/haihaipypy/autodocker/internal/dockerx"
+	"github.com/haihaipypy/autodocker/internal/model"
 )
 
 // 这是一份贴近真实 inspect 响应的容器快照：
@@ -207,4 +208,74 @@ func warnsContain(warns []string, sub string) bool {
 		}
 	}
 	return false
+}
+
+// 重建完成后的状态判定：升到了仓库里那个更高版本才算「已最新」。
+//
+// 只重拉了旧 tag 的内容（目标没跟着 tag 走）时，仓库里那个更高版本仍然在，
+// 状态必须留在「可更新」—— 无脑写「已最新」等于替用户把一条真实的更新藏起来，
+// 一小时后扫描又翻出来，看着像在抽风。
+func TestRebuildStatus(t *testing.T) {
+	cases := []struct {
+		tag, latest string
+		wantStatus  model.Status
+		wantLatest  string
+	}{
+		{"v3.7.0", "v3.7.0", model.StatusUpToDate, ""},
+		{"3.7", "v3.7.0", model.StatusUpToDate, ""}, // 同一版本，写法不同
+		{"v3.6.0", "v3.7.0", model.StatusNewTag, "v3.7.0"},
+		{"v3.6.0", "", model.StatusUpToDate, ""}, // 浮动 tag：本来就没有更高版本
+		{"latest", "", model.StatusUpToDate, ""},
+	}
+	for _, c := range cases {
+		gotStatus, gotLatest := rebuildStatus(c.tag, c.latest)
+		if gotStatus != c.wantStatus || gotLatest != c.wantLatest {
+			t.Errorf("rebuildStatus(%q, %q) = (%s, %q)，期望 (%s, %q)",
+				c.tag, c.latest, gotStatus, gotLatest, c.wantStatus, c.wantLatest)
+		}
+	}
+}
+
+// 判断「容器已经跑在目标镜像上」靠的是镜像编号，不是引用字符串。
+//
+// 只看引用的话，「同一个 tag 内容变了」——这个工具最主要的一种更新——
+// 会被误判成「已经是最新」而直接跳过，用户点完更新什么都没发生。
+// 引用归一这一步是前提：容器里记的是 gdy666/lucky，库里写的是
+// docker.io/gdy666/lucky:latest，指的是同一个东西。
+func TestNormalizeRef(t *testing.T) {
+	same := map[[2]string]bool{
+		{"gdy666/lucky:v3.7.0", "gdy666/lucky:v3.7.0"}:                  true,
+		{"gdy666/lucky", "gdy666/lucky:latest"}:                         true,
+		{"docker.io/library/nginx:1.25", "nginx:1.25"}:                  true,
+		{"index.docker.io/library/nginx", "nginx:latest"}:               true,
+		{"library/redis", "redis"}:                                      true,
+		{"reg.example.com:5000/a/b", "reg.example.com:5000/a/b:latest"}: true,
+		{"reg.example.com:5000/a/b:1", "reg.example.com:5000/a/b:1"}:    true,
+		{"gdy666/lucky:v3.6.0", "gdy666/lucky:v3.7.0"}:                  false,
+		{"nginx:1.25", "nginx:1.26"}:                                    false,
+		{"reg.example.com:5000/a/b:1", "a/b:1"}:                         false,
+	}
+	for pair, want := range same {
+		if got := normalizeRef(pair[0]) == normalizeRef(pair[1]); got != want {
+			t.Errorf("normalizeRef(%q) vs normalizeRef(%q) = %v，期望 %v (%q / %q)",
+				pair[0], pair[1], got, want, normalizeRef(pair[0]), normalizeRef(pair[1]))
+		}
+	}
+}
+
+func TestSameImageID(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"sha256:abc", "sha256:abc", true},
+		{"sha256:abc", "abc", true}, // 有的端点不带前缀
+		{"sha256:abc", "sha256:def", false},
+		{"", "sha256:abc", false}, // 取不到编号时一律当作「不同」，宁可多重建一次
+	}
+	for _, c := range cases {
+		if got := sameImageID(c.a, c.b); got != c.want {
+			t.Errorf("sameImageID(%q,%q) = %v，期望 %v", c.a, c.b, got, c.want)
+		}
+	}
 }

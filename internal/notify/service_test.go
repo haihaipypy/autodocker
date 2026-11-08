@@ -252,7 +252,7 @@ func TestReadyChannelsRespectsSwitch(t *testing.T) {
 	s.fs = feishu.New(feishu.Config{AppID: "cli_x", AppSecret: "secret", ChatID: "oc_x"})
 	s.tg = telegram.New(telegram.Config{Token: "123:abc", ChatID: "-100123"})
 
-	s.ApplyNotifyEnabled(true, false, false)
+	s.ApplyNotifyEnabled(true, false, false, false)
 	got := s.readyChannels()
 	if len(got) != 1 || got[0] != model.ChannelFeishu {
 		t.Fatalf("Telegram 关掉后只该剩飞书，得到 %v", got)
@@ -262,7 +262,7 @@ func TestReadyChannelsRespectsSwitch(t *testing.T) {
 		t.Fatal("关开关不该清掉凭据")
 	}
 
-	s.ApplyNotifyEnabled(false, false, false)
+	s.ApplyNotifyEnabled(false, false, false, false)
 	if got := s.readyChannels(); len(got) != 0 {
 		t.Fatalf("全关后不该有任何渠道就绪，得到 %v", got)
 	}

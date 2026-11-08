@@ -1,13 +1,13 @@
 # AutoDocker
 
-**Docker 镜像更新监测 · 飞书 / Telegram / 钉钉确认 · 一键自动重建**
+**Docker 镜像更新监测 · 飞书 / Telegram / 钉钉 / 企业微信确认 · 一键自动重建**
 
 [![Release](https://img.shields.io/github/v/release/haihaipypy/autodocker?label=release&color=blue)](https://github.com/haihaipypy/autodocker/releases/latest)
 [![Docker Pulls](https://img.shields.io/docker/pulls/haihaipypy/autodocker)](https://hub.docker.com/r/haihaipypy/autodocker)
 [![License](https://img.shields.io/github/license/haihaipypy/autodocker)](LICENSE)
 [![Go](https://img.shields.io/github/go-mod/go-version/haihaipypy/autodocker)](go.mod)
 
-监测本机容器的镜像有没有新版本，推送到飞书、Telegram 或钉钉。在聊天里点「立即更新」，服务按原配置重建容器，
+监测本机容器的镜像有没有新版本，推送到飞书、Telegram、钉钉或企业微信。在聊天里点「立即更新」，服务按原配置重建容器，
 挂载、端口、网络、环境变量全部保留，失败自动回滚。没人用的镜像也能一键清理。
 
 ![AutoDocker](docs/images/cover.png)
@@ -27,8 +27,10 @@
 ## 特性
 
 - **通知渠道可选**：飞书（企业自建应用，长连接收回调）、Telegram（bot 长轮询）、
-  钉钉（企业内部应用，Stream 长连接 + 互动卡片）。填好凭据的渠道都会收到提醒，可以同时用三个。
+  钉钉（企业内部应用，Stream 长连接 + 互动卡片）、企业微信（智能机器人，长连接 + 模板卡片）。
+  填好凭据的渠道都会收到提醒，四个可以同时用。
   每个渠道有独立开关，关掉只停推送、配置保留。设置页左栏选渠道，右栏是所选渠道的完整配置流程。
+  **企业微信是最后一个渠道**，之后不再新增。
 - **容器与镜像分开管理**：容器页看「在跑的东西要不要更新」，镜像页看「磁盘上有什么、能不能清」。
 - **两种检测模式自动判定**：浮动 tag 比摘要；版本号 tag 额外巡检 tag 列表，出现更高版本时提示。
 - **按钮按状态渲染**，不摆灰按钮；检测失败的原因直接写在容器名下方。
@@ -106,7 +108,7 @@ Docker Hub 拉不动时换 GHCR：`ghcr.io/haihaipypy/autodocker:latest`，内�
 
 ![界面](docs/images/ui-dark.png)
 
-定时巡检 → 发现新版本推送到飞书 / Telegram / 钉钉 → 点「立即更新」→ 拉镜像、按原配置重建、健康检查
+定时巡检 → 发现新版本推送到飞书 / Telegram / 钉钉 / 企业微信 → 点「立即更新」→ 拉镜像、按原配置重建、健康检查
 → 通过则删旧容器，不通过自动回滚。
 
 「可用」列写的是仓库里更高的版本号；没有更高版本号但同一 tag 被重新推送过，写「内容已更新」。
@@ -115,7 +117,7 @@ Docker Hub 拉不动时换 GHCR：`ghcr.io/haihaipypy/autodocker:latest`，内�
 
 ## 通知配置
 
-三个渠道任选其一或全用，都在「设置 → 通知渠道」里配。填好凭据的那个渠道测通后开关会自动打开；
+四个渠道任选其一或全用，都在「设置 → 通知渠道」里配。填好凭据的那个渠道测通后开关会自动打开；
 关掉开关只停「推新提醒」，配置一项不动，已发出的卡片也照常回写状态。
 
 ### 飞书
@@ -177,6 +179,24 @@ bot 默认读不到群里的普通聊天（成员列表写「无权读取消息�
 
 → [钉钉配置逐图步骤](docs/dingtalk.md)
 
+### 企业微信
+
+**用「智能机器人 + 长连接」。** 卡片由程序生成，**不用去后台搭模板** —— 这是它比钉钉省事的地方。
+
+六步：管理后台 **智能专区 → 智能机器人** 建机器人，创建方式选「API 模式创建」
+→ 「API 配置」选**长连接** → 「可使用权限」授权**消息**与**通讯录**、使用方式选**多人使用**
+→ 复制 `BotID` 与**长连接专用** `Secret` → 填进设置页保存
+→ 群里 @ 机器人说句话，点「读取会话」挑一条。
+
+群只有**企业内部群**能用，互联群 / 上下游群 / 外部群加不进去。
+
+注意 `Secret` 有三个长得像的（长连接 Secret / Token / EncodingAESKey），只有第一个能用。
+
+一个和别的渠道不同的限制：**卡片只能在点按钮后 5 秒内更新**，重建却要几十秒。
+所以点「立即更新」后卡片会停在「正在更新」，结果改成**另发一条消息**告诉你。
+
+→ [企业微信配置全流程](docs/wecom.md)
+
 ## 安全
 
 - 挂载 `/var/run/docker.sock` 等同于宿主机 root 权限，只在可信内网使用。
@@ -189,8 +209,8 @@ bot 默认读不到群里的普通聊天（成员列表写「无权读取消息�
 
 - 纯 Go 单二进制，前端零构建（`go:embed`），SQLite 用 `modernc.org/sqlite`（免 CGO）。
 - 不依赖 Docker 官方 SDK，直接封装 Engine REST API，`HostConfig` 原样透传。
-- 三个渠道全是长连接：飞书走 WebSocket、Telegram 走 bot 长轮询、钉钉走 Stream ——
-  都免公网、免备案、免反向代理。
+- 四个渠道全是长连接：飞书走 WebSocket、Telegram 走 bot 长轮询、
+  钉钉走 Stream、企业微信走官方长连接 —— 都免公网、免备案、免反向代理。
 - 注册表加速三层兜底：用户设置 → 守护进程 `registry-mirrors` → 内置默认，只作用于 Docker Hub。
 
 → [技术实现与目录结构](docs/architecture.md)
@@ -212,6 +232,7 @@ MIT，见 [LICENSE](LICENSE)。
 | [feishu.md](docs/feishu.md) | 飞书自建应用配置全流程（含截图） |
 | [telegram.md](docs/telegram.md) | Telegram bot 配置全流程、收不到消息的排查 |
 | [dingtalk.md](docs/dingtalk.md) | 钉钉企业内部应用、卡片模板、Stream 长连接的配置全流程 |
+| [wecom.md](docs/wecom.md) | 企业微信智能机器人、长连接、按钮与 5 秒限制 |
 | [usage.md](docs/usage.md) | 两个列表的边界、忽略粒度、检测模式、界面 |
 | [architecture.md](docs/architecture.md) | 技术选型、重建保真规则、存储坑位、测试 |
 | [faq.md](docs/faq.md) | 安全须知、已知边界、常见故障排查 |

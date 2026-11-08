@@ -113,6 +113,9 @@ docker compose up -d --build
 | `DINGTALK_CLIENT_ID` / `DINGTALK_CLIENT_SECRET` | 钉钉企业内部应用的 Client ID / Secret，同上。Secret **只显示一次** |
 | `DINGTALK_CARD_TEMPLATE_ID` | 卡片平台上已发布模板的 ID（不是模板名称） |
 | `DINGTALK_CONVERSATION_ID` | 接收卡片的群会话 ID，也可在设置页点「读取会话」自动填 |
+| `WECOM_BOT_ID` | 企业微信智能机器人的 BotID |
+| `WECOM_SECRET` | 智能机器人的**长连接专用** Secret（不是 Token / EncodingAESKey） |
+| `WECOM_CHAT_ID` | 接收卡片的会话：群聊填 chatid，单聊填 userid，也可点「读取会话」自动填 |
 | `AUTO_UPDATE` | 发现即自动更新（无人值守）。默认关闭，即「发现 → 通知 → 等人确认」 |
 | `WATCH` | 额外监控本机没有运行的镜像，逗号分隔，例如 `nginx:1.25,redis:7.2` |
 | `ROLLBACK_ON_FAILURE` | 更新失败是否自动回滚，默认 `true` |

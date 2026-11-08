@@ -123,11 +123,13 @@ const (
 	ChannelFeishu   Channel = "feishu"
 	ChannelTelegram Channel = "telegram"
 	ChannelDingTalk Channel = "dingtalk"
+	ChannelWeCom    Channel = "wecom"
 )
 
 // Valid 是否是已实现的渠道。
 func (c Channel) Valid() bool {
-	return c == ChannelFeishu || c == ChannelTelegram
+	return c == ChannelFeishu || c == ChannelTelegram ||
+		c == ChannelDingTalk || c == ChannelWeCom
 }
 
 // CardState 卡片/消息上承载的交互状态。
@@ -250,6 +252,7 @@ type Settings struct {
 	FeishuEnabled   *bool `json:"feishu_enabled"`
 	TelegramEnabled *bool `json:"telegram_enabled"`
 	DingTalkEnabled *bool `json:"dingtalk_enabled"`
+	WeComEnabled    *bool `json:"wecom_enabled"`
 
 	// 飞书凭据放在设置里而不是只在环境变量里：应用装好后用户直接进页面填，
 	// 不用回到安装向导；环境变量只作为首次启动的初值。
@@ -272,6 +275,13 @@ type Settings struct {
 	DingTalkClientSecret   string `json:"dingtalk_client_secret"`
 	DingTalkCardTemplateID string `json:"dingtalk_card_template_id"`
 	DingTalkConversationID string `json:"dingtalk_conversation_id"`
+
+	// 企业微信：智能机器人 + 长连接（免公网）+ 模板卡片。
+	// 与钉钉相反，卡片结构由代码定义，不用去后台搭模板；
+	// 但卡片只能在按钮事件后 5 秒内更新，重建结果只能补发一条新消息。
+	WeComBotID  string `json:"wecom_bot_id"`
+	WeComSecret string `json:"wecom_secret"`
+	WeComChatID string `json:"wecom_chat_id"`
 
 	// 访问密码同样放在设置里：默认留空即不启用登录。
 	// 本应用能重建任意容器（等同于系统最高权限），只在确实需要时开。

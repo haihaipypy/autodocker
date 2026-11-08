@@ -50,6 +50,11 @@ type Config struct {
 	DingTalkCardTemplateID string
 	DingTalkConversationID string
 
+	// 企业微信（智能机器人 + 长连接 + 模板卡片）
+	WeComBotID  string
+	WeComSecret string
+	WeComChatID string
+
 	// 更新策略
 	AutoUpdateEnabled bool // 检测到更新后是否无需确认直接更新
 	RequireConfirm    bool // 是否需要用户点击卡片按钮确认
@@ -97,6 +102,9 @@ func Load() (*Config, error) {
 		DingTalkClientSecret:    envStr("DINGTALK_CLIENT_SECRET", ""),
 		DingTalkCardTemplateID:  envStr("DINGTALK_CARD_TEMPLATE_ID", ""),
 		DingTalkConversationID:  envStr("DINGTALK_CONVERSATION_ID", ""),
+		WeComBotID:              envStr("WECOM_BOT_ID", ""),
+		WeComSecret:             envStr("WECOM_SECRET", ""),
+		WeComChatID:             envStr("WECOM_CHAT_ID", ""),
 		AutoUpdateEnabled:       envBool("AUTO_UPDATE", false),
 		RequireConfirm:          envBool("REQUIRE_CONFIRM", true),
 		UpdateTimeout:           time.Duration(envInt("UPDATE_TIMEOUT", 300)) * time.Second,

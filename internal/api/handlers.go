@@ -14,6 +14,7 @@ import (
 	"github.com/haihaipypy/autodocker/internal/model"
 	"github.com/haihaipypy/autodocker/internal/notify/dingtalk"
 	"github.com/haihaipypy/autodocker/internal/notify/telegram"
+	"github.com/haihaipypy/autodocker/internal/notify/wecom"
 	"github.com/haihaipypy/autodocker/internal/registry"
 	"github.com/haihaipypy/autodocker/internal/scanner"
 	"github.com/haihaipypy/autodocker/internal/selfcheck"
@@ -999,10 +1000,43 @@ func (s *Server) handleDingTalkStatus(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, resp)
 }
 
+func (s *Server) handleWeComTest(w http.ResponseWriter, r *http.Request) {
+	if err := s.nt.SendTestWeCom(r.Context()); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeOK(w, map[string]any{"result": "sent"})
+}
+
+// handleWeComStatus 长连接状态与会话列表。
+//
+// 企业微信没有独立的「检测连通性」接口：认证就是建立长连接本身，
+// 所以这个接口同时承担两件事 —— 告诉设置页连上没有，以及缺哪几项。
+func (s *Server) handleWeComStatus(w http.ResponseWriter, r *http.Request) {
+	at, action, ch, count := s.nt.CallbackState()
+	wc := s.nt.WeCom()
+
+	resp := map[string]any{
+		"configured":     wc.Configured(),
+		"ready":          wc.Ready(),
+		"running":        s.nt.WeComRunning(),
+		"chat_id":        wc.ChatID(),
+		"missing":        wc.MissingForSend(),
+		"chats":          s.nt.WeComChats(),
+		"last_error":     s.nt.WeComLastError(),
+		"last_action":    action,
+		"last_channel":   string(ch),
+		"callback_count": count,
+	}
+	if !at.IsZero() {
+		resp["last_callback_at"] = at.Format(time.RFC3339)
+	}
+	writeOK(w, resp)
+}
+
 type registryTestReq struct {
 	Reference string `json:"reference"`
-} // handleRegistryTest 逐个探测注册表与各加速源的连通情况。
-// 镜像列表里全是「未知」时，用户只看到三个字，无从下手。
+} // handleRegistryTest 逐个探测注册表与各加速源的连通情况。// 镜像列表里全是「未知」时，用户只看到三个字，无从下手。
 // 这个接口把「直连通不通、加速站通不通、tag 到底在不在」逐条摆出来，
 // 让排查从「猜」变成「看」。
 func (s *Server) handleRegistryTest(w http.ResponseWriter, r *http.Request) {
@@ -1087,6 +1121,10 @@ func (s *Server) LoadSettings() model.Settings {
 		DingTalkCardTemplateID: s.cfg.DingTalkCardTemplateID,
 		DingTalkConversationID: s.cfg.DingTalkConversationID,
 
+		WeComBotID:  s.cfg.WeComBotID,
+		WeComSecret: s.cfg.WeComSecret,
+		WeComChatID: s.cfg.WeComChatID,
+
 		AdminUser:     authUser,
 		AdminPassword: authPass,
 
@@ -1107,7 +1145,9 @@ func (s *Server) LoadSettings() model.Settings {
 	feOn := enabledOrDefault(out.FeishuEnabled, feishuReady(out))
 	tgOn := enabledOrDefault(out.TelegramEnabled, out.TelegramBotToken != "" && out.TelegramChatID != "")
 	dtOn := enabledOrDefault(out.DingTalkEnabled, dingtalkReady(out))
+	wcOn := enabledOrDefault(out.WeComEnabled, wecomReady(out))
 	out.FeishuEnabled, out.TelegramEnabled, out.DingTalkEnabled = &feOn, &tgOn, &dtOn
+	out.WeComEnabled = &wcOn
 
 	return out
 }
@@ -1127,6 +1167,10 @@ func feishuReady(s model.Settings) bool {
 func dingtalkReady(s model.Settings) bool {
 	return s.DingTalkClientID != "" && s.DingTalkClientSecret != "" &&
 		s.DingTalkCardTemplateID != "" && s.DingTalkConversationID != ""
+}
+
+func wecomReady(s model.Settings) bool {
+	return s.WeComBotID != "" && s.WeComSecret != "" && s.WeComChatID != ""
 }
 
 func (s *Server) saveSettings(in model.Settings) error {
@@ -1194,11 +1238,17 @@ func (s *Server) ApplySettings(in model.Settings) {
 		CardTemplateID: in.DingTalkCardTemplateID,
 		ConversationID: in.DingTalkConversationID,
 	})
-	// 开关同样按「缺失就按凭据推导」处理：老客户端或脚本 PUT 时不会带这三个字段，
+	s.nt.ApplyWeCom(wecom.Config{
+		BotID:  in.WeComBotID,
+		Secret: in.WeComSecret,
+		ChatID: in.WeComChatID,
+	})
+	// 开关同样按「缺失就按凭据推导」处理：老客户端或脚本 PUT 时不会带这几个字段，
 	// 一律当 false 会把用户正在用的渠道全关掉，而且下次打开页面才看得出来。
 	s.nt.ApplyNotifyEnabled(
 		enabledOrDefault(in.FeishuEnabled, feishuReady(in)),
 		enabledOrDefault(in.TelegramEnabled, in.TelegramBotToken != "" && in.TelegramChatID != ""),
 		enabledOrDefault(in.DingTalkEnabled, dingtalkReady(in)),
+		enabledOrDefault(in.WeComEnabled, wecomReady(in)),
 	)
 }

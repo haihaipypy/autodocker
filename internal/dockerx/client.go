@@ -608,19 +608,39 @@ func (c *Client) isNegotiated() bool {
 }
 
 // decodeAPIError 把守护进程返回的 {"message": "..."} 转成可读错误。
+// APIError 守护进程返回的非 2xx 响应。
+//
+// 单独成类型，是因为调用方要能分辨具体状态：「这个容器已经不存在了」（404）
+// 和「守护进程连不上」完全是两回事 —— 前者说明记录过期，后者说明环境坏了。
+// 只看错误文本做字符串匹配的话，换个 Docker 版本、换种措辞就失效。
+type APIError struct {
+	Status  int
+	Message string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("Docker API %d: %s", e.Status, e.Message)
+}
+
+// IsNotFound 判断错误是不是「找不到这个对象」（HTTP 404）。
+func IsNotFound(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound
+}
+
 func decodeAPIError(resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 	var payload struct {
 		Message string `json:"message"`
 	}
 	if err := json.Unmarshal(body, &payload); err == nil && payload.Message != "" {
-		return fmt.Errorf("Docker API %d: %s", resp.StatusCode, payload.Message)
+		return &APIError{Status: resp.StatusCode, Message: payload.Message}
 	}
 	msg := strings.TrimSpace(string(body))
 	if msg == "" {
 		msg = resp.Status
 	}
-	return fmt.Errorf("Docker API %d: %s", resp.StatusCode, msg)
+	return &APIError{Status: resp.StatusCode, Message: msg}
 }
 
 // ---- 引用解析辅助 ----

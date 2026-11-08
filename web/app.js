@@ -289,7 +289,7 @@ function renderStats() {
     statusEl.textContent = '扫描中';
     statusEl.className = 'pill info';
   } else {
-    // 三个渠道可能同时配好了，胶囊只写「已连接」，具体是哪几个挂 title 上。
+    // 多个渠道可能同时配好了，胶囊只写「已连接」，具体是哪几个挂 title 上。
     // 写死渠道名（「飞书 已连接」）在同时配了别的渠道时是错的。
     const chans = (s.notify_channels || []).filter((c) => c.configured);
     const active = chans.filter((c) => c.enabled);
@@ -575,19 +575,14 @@ function renderNotifications() {
 
 // 通知渠道清单。
 //
-// ready=false 的只在页面上列出来、不能选：用户明确要求把后续要做的渠道摆出来，
-// 写「施工中」比什么都不说清楚得多。加新渠道时改这里 + 后端 Channel 枚举即可。
+// 只列**已经能用**的四个。曾经在这里摆过 Slack / Discord / Gotify / ntfy / Bark / 邮件，
+// 一律标「施工中」—— 占位摆了大半年也没做，反而让人以为「是不是我没配出来」。
+// 现在明确：企业微信是最后一个渠道，以后只维护这四个。
 const CHANNELS = [
-  { id: 'feishu', name: '飞书', ready: true },
-  { id: 'telegram', name: 'Telegram', ready: true },
-  { id: 'dingtalk', name: '钉钉', ready: true },
-  { id: 'wecom', name: '企业微信', ready: false },
-  { id: 'slack', name: 'Slack', ready: false },
-  { id: 'discord', name: 'Discord', ready: false },
-  { id: 'gotify', name: 'Gotify', ready: false },
-  { id: 'ntfy', name: 'ntfy', ready: false },
-  { id: 'bark', name: 'Bark', ready: false },
-  { id: 'smtp', name: '邮件', ready: false },
+  { id: 'feishu', name: '飞书' },
+  { id: 'telegram', name: 'Telegram' },
+  { id: 'dingtalk', name: '钉钉' },
+  { id: 'wecom', name: '企业微信' },
 ];
 
 // currentChannel 当前应该显示哪个渠道的设置。
@@ -597,9 +592,10 @@ const CHANNELS = [
 function currentChannel() {
   const s = state.settings || {};
   const ch = s.notify_channel;
-  if (ch === 'telegram' || ch === 'feishu' || ch === 'dingtalk') return ch;
+  if (ch === 'telegram' || ch === 'feishu' || ch === 'dingtalk' || ch === 'wecom') return ch;
   if (!s.feishu_app_id && s.telegram_bot_token) return 'telegram';
   if (!s.feishu_app_id && !s.telegram_bot_token && s.dingtalk_client_id) return 'dingtalk';
+  if (!s.feishu_app_id && !s.telegram_bot_token && !s.dingtalk_client_id && s.wecom_bot_id) return 'wecom';
   return 'feishu';
 }
 
@@ -608,6 +604,7 @@ function channelConfigured(id) {
   if (id === 'feishu') return !!(s.feishu_app_id && s.feishu_app_secret);
   if (id === 'telegram') return !!s.telegram_bot_token;
   if (id === 'dingtalk') return !!(s.dingtalk_client_id && s.dingtalk_client_secret);
+  if (id === 'wecom') return !!(s.wecom_bot_id && s.wecom_secret);
   return false;
 }
 
@@ -634,6 +631,9 @@ function channelMissing(id) {
     return ['dingtalk_client_id', 'dingtalk_client_secret', 'dingtalk_card_template_id', 'dingtalk_conversation_id']
       .filter((k) => !s[k]);
   }
+  if (id === 'wecom') {
+    return ['wecom_bot_id', 'wecom_secret', 'wecom_chat_id'].filter((k) => !s[k]);
+  }
   return [];
 }
 
@@ -659,15 +659,13 @@ function stashChannelFields() {
   take('dingtalk_client_secret', 'dingtalk_client_secret');
   take('dingtalk_card_template_id', 'dingtalk_card_template_id');
   take('dingtalk_conversation_id', 'dingtalk_conversation_id');
+  take('wecom_bot_id', 'wecom_bot_id');
+  take('wecom_secret', 'wecom_secret');
+  take('wecom_chat_id', 'wecom_chat_id');
 }
 
 function channelChipsHtml(ch) {
   return CHANNELS.map((c) => {
-    if (!c.ready) {
-      return `<span class="channel-chip soon" aria-disabled="true">
-        <span class="chip-name">${esc(c.name)}</span>
-        <span class="chip-sub">施工中</span></span>`;
-    }
     const active = c.id === ch ? ' active' : '';
     // 三种状态要分开：没配、配好了在推、配好了但用户主动关掉。
     // 都写成「已填写凭据」的话，关掉之后看不出是暂停还是坏了。
@@ -810,6 +808,118 @@ function dingtalkFieldsHtml(s) {
         钉钉不提供「机器人所在群」的列表接口，只能等它在群里收到消息时自己报上来。
       </p>
       <div id="dt-chat-list" class="chat-pick" hidden></div>
+    </div>`;
+}
+
+function wecomFieldsHtml(s) {
+  return `
+    <div class="field">
+      <label for="wecom_bot_id">机器人 BotID</label>
+      <input id="wecom_bot_id" name="wecom_bot_id" type="text"
+             value="${esc(s.wecom_bot_id)}" placeholder="企业微信智能机器人的 BotID">
+      <p class="field-hint">
+        管理后台 → <b>智能专区</b> → 智能机器人 → 选中机器人 → 「API 配置」里能看到。
+      </p>
+    </div>
+    <div class="field">
+      <label for="wecom_secret">长连接 Secret</label>
+      <input id="wecom_secret" name="wecom_secret" type="password"
+             value="${esc(s.wecom_secret)}" placeholder="只显示一次，复制过来">
+      <p class="field-hint">
+        同一页「API 模式 → 长连接」下方那个 Secret。注意<b>不是</b>接收 URL 模式的
+        Token / EncodingAESKey，两者不通用，填错了会一直连不上。
+        仅保存在本机数据库里；保存后自动建立长连接。
+      </p>
+    </div>
+    <div class="field">
+      <label for="wecom_chat_id">接收会话</label>
+      <div class="input-row">
+        <input id="wecom_chat_id" name="wecom_chat_id" type="text"
+               value="${esc(s.wecom_chat_id)}" placeholder="群聊填 chatid，单聊填 userid">
+        <button type="button" id="btn-wc-chats" class="btn ghost">读取会话</button>
+      </div>
+      <p class="field-hint">
+        把机器人加进目标群，在群里 <b>@它说一句话</b>（单聊就直接给它发一句），
+        再点「读取会话」挑一条 —— 企业微信没有「机器人所在群」的接口，
+        只能等它在会话里收到消息时自己报上来。
+      </p>
+      <div id="wc-chat-list" class="chat-pick" hidden></div>
+    </div>`;
+}
+
+// wecomStatusText 右栏「当前状态」那一行。
+//
+// 长连接状态只能从后端问：企业微信没有独立的「检测」接口，
+// 认证就是建立长连接本身，连上了才算凭据对、网络通。
+function wecomStatusText() {
+  const s = state.settings || {};
+  const st = state.wecom || {};
+  if (!s.wecom_bot_id || !s.wecom_secret) {
+    return '未配置，发现新版本只会记录在「通知」标签里';
+  }
+  if (st.running) return '已配置，长连接在线';
+  return '已配置，但长连接未建立' +
+    (st.last_error ? `：${st.last_error}` : '（保存后稍等几秒，或看容器日志）');
+}
+
+async function refreshWeComStatus() {
+  try {
+    state.wecom = await api('/api/wecom/status');
+  } catch (_) {
+    return;
+  }
+  // 只更新那一行，不重绘整块：重绘会把用户展开的步骤折叠回去。
+  const el = $('#wc-live-status');
+  if (el) el.textContent = wecomStatusText();
+}
+
+function wecomGuideHtml() {
+  return `
+    <div class="guide-card">
+      <h3>企业微信 · 配置流程</h3>
+      <p class="field-hint">
+        配置完后发现新版本会往企业微信推一张带按钮的卡片，点按钮直接重建容器。
+        走<b>长连接</b>，不需要公网地址、不需要域名备案、也不用加解密。
+      </p>
+      <p class="field-hint">当前状态：<b id="wc-live-status">${esc(wecomStatusText())}</b></p>
+      <details class="setup-guide" open>
+        <summary>共 6 步，第一次配置照着做</summary>
+        <ol class="setup-steps">
+          <li>
+            <b>建机器人</b>：<a href="https://work.weixin.qq.com/wework_admin/frame" target="_blank" rel="noreferrer">企业微信管理后台</a>
+            → <b>智能专区</b> → <b>智能机器人</b> → 创建 → 新建机器人，
+            创建方式选 <b>「API 模式创建」</b>，名字随意。
+          </li>
+          <li>
+            <b>开长连接</b>：同一个创建页，右侧「API 配置」选<b>「使用长连接」</b>。
+          </li>
+          <li>
+            <b>授权能力</b>：往下「使用模式 → 可使用权限」点<b>「去授权」</b>，
+            勾上 <b>消息</b>（发卡片要用）与 <b>通讯录</b>（认得出是谁在 @ 它），
+            文档、邮件、待办、日程、会议、微盘都不用勾；「使用方式」选 <b>「多人使用」</b>，
+            否则只有你自己能点卡片上的按钮。
+          </li>
+          <li>
+            <b>取凭据</b>：同一页拿到 <code>BotID</code> 与<b>长连接专用</b>
+            <code>Secret</code>，填到左侧两项，点「保存设置」。
+          </li>
+          <li>
+            <b>取会话</b>：把机器人加进目标群，在群里 @它 说一句话（单聊就直接发一句），
+            然后点左侧「读取会话」挑一条填入。<br>
+            <span class="field-hint">只有<b>企业内部群</b>能加机器人；互联群、上下游群、
+            外部群都加不进去，硬拉会收不到任何消息。</span>
+          </li>
+          <li>
+            <b>验证</b>：点下方「发送企业微信测试卡片」，卡片到了再点一下卡片上的任意按钮 ——
+            卡片当场变样，才算「发得出去 + 收得回按钮」两条链路都通。
+          </li>
+        </ol>
+      </details>
+      <p class="field-hint">
+        有一个与其它渠道不同的限制：<b>卡片只能在点按钮后 5 秒内更新</b>。
+        所以点完按钮卡片会变成「正在更新」，更新结果会<b>另发一条消息</b> ——
+        原来那张卡片会一直停在「正在更新」，这是协议限制，不是坏了。
+      </p>
     </div>`;
 }
 
@@ -1057,6 +1167,12 @@ function renderGuide(ch) {
     guide.innerHTML = dingtalkGuideHtml();
     return;
   }
+  if (ch === 'wecom') {
+    guide.innerHTML = wecomGuideHtml();
+    // 状态要去后端问一次：长连接是否在线只有服务端知道。
+    refreshWeComStatus();
+    return;
+  }
   guide.innerHTML = feishuGuideHtml();
 }
 
@@ -1065,13 +1181,19 @@ function renderSettings() {
   if (!s) return;
   const selfSt = state.self || {};
   const ch = currentChannel();
-  const chName = { feishu: '飞书', telegram: 'Telegram', dingtalk: '钉钉' }[ch] || '飞书';
-  const testLabel = ch === 'telegram'
-    ? '发送测试消息'
-    : (ch === 'dingtalk' ? '发送钉钉测试卡片' : '发送飞书测试卡片');
-  const fields = ch === 'telegram'
-    ? telegramFieldsHtml(s)
-    : (ch === 'dingtalk' ? dingtalkFieldsHtml(s) : feishuFieldsHtml(s));
+  const chName = { feishu: '飞书', telegram: 'Telegram', dingtalk: '钉钉', wecom: '企业微信' }[ch] || '飞书';
+  const testLabel = {
+    feishu: '发送飞书测试卡片',
+    telegram: '发送测试消息',
+    dingtalk: '发送钉钉测试卡片',
+    wecom: '发送企业微信测试卡片',
+  }[ch] || '发送测试卡片';
+  const fields = {
+    feishu: feishuFieldsHtml,
+    telegram: telegramFieldsHtml,
+    dingtalk: dingtalkFieldsHtml,
+    wecom: wecomFieldsHtml,
+  }[ch](s);
 
   $('#settings-form').innerHTML = `
     <div class="field">
@@ -1088,7 +1210,7 @@ function renderSettings() {
     <h3 class="form-section">通知渠道</h3>
     <p class="field-hint">发现新版本时把提醒推到哪里。<b>开着开关、凭据齐全的渠道都会收到</b>；关掉某个渠道只是不再推新提醒，配置一项都不会丢。右栏是当前所选渠道的完整配置流程 —— 选谁只决定改哪份配置。</p>
     <div class="channel-picker">${channelChipsHtml(ch)}</div>
-    <p class="field-hint">灰色的渠道还在做，暂时不能选。</p>
+    <p class="field-hint">企业微信是最后一个渠道 —— 这四个之外不再增加新的。</p>
     ${channelSwitchHtml(ch, chName)}
     ${fields}
 
@@ -1702,11 +1824,15 @@ function settingsPayload() {
     dingtalk_client_secret: cur.dingtalk_client_secret || '',
     dingtalk_card_template_id: cur.dingtalk_card_template_id || '',
     dingtalk_conversation_id: cur.dingtalk_conversation_id || '',
-    // 三个开关必须每次都回传：后端把「缺字段」当成「没设置过」，
+    wecom_bot_id: cur.wecom_bot_id || '',
+    wecom_secret: cur.wecom_secret || '',
+    wecom_chat_id: cur.wecom_chat_id || '',
+    // 四个开关必须每次都回传：后端把「缺字段」当成「没设置过」，
     // 会退回按凭据推导，用户显式关掉的状态就丢了。
     feishu_enabled: channelEnabledState('feishu'),
     telegram_enabled: channelEnabledState('telegram'),
     dingtalk_enabled: channelEnabledState('dingtalk'),
+    wecom_enabled: channelEnabledState('wecom'),
     registry_mirror: $('#registry_mirror').value.trim(),
     // 自检开关每次都要带上，否则保存一次设置就把用户关掉的检查又打开了
     check_updates: $('#check_updates') ? $('#check_updates').checked : true,
@@ -1788,15 +1914,17 @@ async function reconnectSelfCheck() {
 // notifyStatusURL 各渠道的链路状态地址。
 function notifyStatusURL(ch) {
   if (ch === 'dingtalk') return '/api/dingtalk/status';
+  if (ch === 'wecom') return '/api/wecom/status';
   return ch === 'telegram' ? '/api/telegram/status' : '/api/feishu/status';
 }
 
-// 各渠道「点什么、在哪点」的文案。三个渠道的说法完全不一样，
+// 各渠道「点什么、在哪点」的文案。四个渠道的说法完全不一样，
 // 写死一句「请到群里点一下」会让人在钉钉里找飞书卡片。
 const PICK_HINT = {
   feishu: '请到飞书群里点一下卡片上的按钮',
   telegram: '请在 Telegram 里点一下消息上的按钮',
   dingtalk: '请在钉钉群里点一下卡片上的按钮',
+  wecom: '请在企业微信会话里点一下卡片上的按钮',
 };
 
 // testNotify 给当前渠道发一条测试消息，然后盯着按钮回调。
@@ -1817,7 +1945,9 @@ async function testNotify() {
 
   const testURL = ch === 'telegram'
     ? '/api/telegram/test'
-    : (ch === 'dingtalk' ? '/api/dingtalk/test' : '/api/feishu/test');
+    : (ch === 'dingtalk'
+      ? '/api/dingtalk/test'
+      : (ch === 'wecom' ? '/api/wecom/test' : '/api/feishu/test'));
 
   try {
     await api(testURL, { method: 'POST' });
@@ -1845,15 +1975,21 @@ function waitCallback(base, ch) {
     if (left <= 0) {
       clearInterval(timer);
       el.className = 'callback-state bad';
-      el.innerHTML = ch === 'dingtalk'
-        ? '未收到按钮回调。请检查：① 卡片模板里三个按钮是否都配了「回传请求」，' +
+      if (ch === 'dingtalk') {
+        el.innerHTML = '未收到按钮回调。请检查：① 卡片模板里三个按钮是否都配了「回传请求」，' +
           '参数是否写成 <code>{"action":"update"}</code> 这种形式；' +
-          '② 改完模板后是否<b>重新发布了应用版本</b>；③ 机器人是否还在那个群里。'
-        : (ch === 'telegram'
-          ? '未收到按钮回调。请确认 bot 没在别处设过 webhook（它与长轮询互斥），' +
-            '并查看设置页上方的长轮询状态与容器日志。'
-          : '未收到按钮回调。请检查「回调配置」里是否加了 <code>card.action.trigger</code>，' +
-            '以及改完权限/回调后是否<b>发布了新版本</b>。');
+          '② 改完模板后是否<b>重新发布了应用版本</b>；③ 机器人是否还在那个群里。';
+      } else if (ch === 'wecom') {
+        el.innerHTML = '未收到按钮回调。请检查：① 机器人配置页的「API 模式」是否选了<b>「长连接」</b>；' +
+          '② 填的 Secret 是不是<b>长连接专用</b>那个（不是接收 URL 模式的 Token）；' +
+          '③ 右栏「当前状态」里长连接是否显示在线；④ 机器人是否还在那个会话里。';
+      } else if (ch === 'telegram') {
+        el.innerHTML = '未收到按钮回调。请确认 bot 没在别处设过 webhook（它与长轮询互斥），' +
+          '并查看设置页上方的长轮询状态与容器日志。';
+      } else {
+        el.innerHTML = '未收到按钮回调。请检查「回调配置」里是否加了 <code>card.action.trigger</code>，' +
+          '以及改完权限/回调后是否<b>发布了新版本</b>。';
+      }
       return;
     }
     try {
@@ -2167,6 +2303,57 @@ async function loadDingTalkChats() {
   }
 }
 
+// loadWeComChats 读取机器人在企业微信上收到过消息的会话。
+//
+// 与钉钉同一套逻辑：企业微信也没有「机器人所在群列表」接口，
+// 会话 ID 只能在它收到消息时随回调带上来。
+async function loadWeComChats() {
+  const box = $('#wc-chat-list');
+  const btn = $('#btn-wc-chats');
+  if (!box) return;
+  if (btn) btn.disabled = true;
+  box.hidden = false;
+  box.className = 'chat-pick loading';
+  box.textContent = '读取中…';
+  try {
+    const st = await api('/api/wecom/status');
+    state.wecom = st;
+    const chats = st.chats || [];
+    if (!chats.length) {
+      box.className = 'chat-pick empty';
+      const err = st.last_error ? `<p class="chat-err">长连接报错：${esc(st.last_error)}</p>` : '';
+      const body = st.last_error
+        ? '<p><b>先解决连不上的问题：</b>长连接没建立时，机器人收不到任何消息。</p>'
+        : `<p><b>企业微信不会主动告诉服务「机器人在哪些群」</b>，只有机器人在会话里收到一条消息时，
+             才会把会话 ID 一起带上来。</p>
+           <p>① 确认机器人已经加进目标群；<br>
+              ② 在群里 <code>@机器人 说句话</code>（单聊就直接发一句）；<br>
+              ③ 回来再点一次「读取会话」。</p>
+           <p class="field-hint">收到一次就够了 —— 会话会存进数据库，之后重启、装新包都不用再 @。</p>`;
+      const diag = [
+        '长连接：' + (st.running ? '运行中' : (st.configured ? '未运行' : '凭据未配置')),
+        '会话：' + (st.chat_id || '未填'),
+        '还缺：' + ((st.missing || []).join('、') || '无'),
+      ].join(' · ');
+      box.innerHTML = `<p>还没收到过任何消息。</p>${err}${body}
+        <p class="chat-diag mono">${esc(diag)}</p>`;
+      return;
+    }
+    box.className = 'chat-pick';
+    box.innerHTML = chats.map((c) => `
+      <button type="button" class="chat-item" data-chat="${esc(c.id)}" data-field="wecom_chat_id">
+        <span class="chat-title">${esc(c.title || c.id)}</span>
+        <span class="chat-id mono">${esc(c.id)}</span>
+      </button>`).join('') +
+      '<p class="field-hint">列表已存进数据库，重启后仍在；只有加了一个新群才需要再 @ 一次机器人。</p>';
+  } catch (e) {
+    box.className = 'chat-pick empty';
+    box.textContent = '读取失败：' + e.message;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 function renderRegistryTest(res) {  const rows = (res.results || []).map((r) => `
     <div class="test-line ${r.ok ? 'ok' : 'bad'}">
       <span class="test-host mono">${esc(r.label)}${r.mirror ? '<i class="tag-mini">加速</i>' : ''}</span>
@@ -2357,6 +2544,7 @@ document.addEventListener('click', async (ev) => {
   if (ev.target.id === 'btn-tg-chats') loadTelegramChats();
   if (ev.target.id === 'btn-tg-check') checkTelegram();
   if (ev.target.id === 'btn-dt-chats') loadDingTalkChats();
+  if (ev.target.id === 'btn-wc-chats') loadWeComChats();
   if (ev.target.id === 'btn-dt-check') checkDingTalk();
   if (ev.target.id === 'btn-test-registry') testRegistry();
   if (ev.target.id === 'btn-clean') openCleanModal();

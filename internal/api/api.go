@@ -152,6 +152,10 @@ func (s *Server) Handler() http.Handler {
 	// 钉钉链路状态：Stream 是否在跑、机器人在哪些群里收到过消息
 	mux.HandleFunc("GET /api/dingtalk/status", s.handleDingTalkStatus)
 
+	mux.HandleFunc("POST /api/wecom/test", s.handleWeComTest)
+	// 企业微信链路状态：长连接是否在线、机器人在哪些会话里收到过消息
+	mux.HandleFunc("GET /api/wecom/status", s.handleWeComStatus)
+
 	// 注册表连通性诊断：列表里出现「未知」时用来定位到底是哪一环不通
 	mux.HandleFunc("POST /api/registry/test", s.handleRegistryTest)
 
