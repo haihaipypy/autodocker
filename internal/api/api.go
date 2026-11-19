@@ -136,6 +136,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/settings", s.handleGetSettings)
 	mux.HandleFunc("PUT /api/settings", s.handlePutSettings)
 
+	// 外部应用推送：本机其它程序带推送令牌调用，把消息推到已配好的通知渠道。
+	// 令牌的生成与撤销走网页登录，调用这个接口本身不需要管理员口令。
+	mux.HandleFunc("POST /api/push", s.handlePush)
+	mux.HandleFunc("POST /api/push/token", s.handleRotatePushToken)
+	mux.HandleFunc("DELETE /api/push/token", s.handleRevokePushToken)
+
 	mux.HandleFunc("POST /api/feishu/test", s.handleFeishuTest)
 	// 飞书链路状态：长连接是否就绪、服务启动以来收没收到过按钮回调
 	mux.HandleFunc("GET /api/feishu/status", s.handleFeishuStatus)
@@ -215,6 +221,13 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user, pass := s.auth()
 		if pass == "" || !strings.HasPrefix(r.URL.Path, "/api/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// 推送接口自带令牌鉴权（见 handlePush），不走网页登录：
+		// 调用方是别的程序，让它去保管管理员口令既别扭又扩大泄露面。
+		// 只放行 /api/push 本身，/api/push/token 那两个仍要登录。
+		if r.URL.Path == "/api/push" {
 			next.ServeHTTP(w, r)
 			return
 		}

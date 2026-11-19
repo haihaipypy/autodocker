@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -629,6 +630,135 @@ func (s *Service) Notify(ctx context.Context, n *model.Notification) (string, er
 	n.ChatRef = deliveries[0].ChatRef
 	n.MessageID = deliveries[0].MessageID
 	return deliveries[0].MessageID, nil
+}
+
+// PushRequest 外部应用交代要推的一条消息。
+type PushRequest struct {
+	Title   string
+	Body    string
+	Channel string // 空或 all 表示所有已就绪渠道
+}
+
+// PushResult 单个渠道的投递结果。
+type PushResult struct {
+	Channel string `json:"channel"`
+	OK      bool   `json:"ok"`
+	Error   string `json:"error,omitempty"`
+}
+
+// Push 把一条外部消息推到已就绪的渠道，逐渠道返回结果。
+//
+// 与 Notify 走的不是同一条路，这点是有意的：这里不落库、不建通知记录、
+// 不带任何按钮。外部消息没有「哪个容器要更新」这回事，硬套进那套模型
+// 只会让页面的历史列表混进一堆点不动的条目。
+//
+// 渠道之间互不影响，一个发出去就算成功；全部失败时才返回错误。
+func (s *Service) Push(ctx context.Context, in PushRequest) ([]PushResult, error) {
+	chans, err := s.pushTargets(in.Channel)
+	if err != nil {
+		return nil, err
+	}
+
+	title := strings.TrimSpace(in.Title)
+	body := strings.TrimSpace(in.Body)
+
+	out := make([]PushResult, 0, len(chans))
+	failed := 0
+	for _, ch := range chans {
+		res := PushResult{Channel: string(ch)}
+		var serr error
+		switch ch {
+		case model.ChannelFeishu:
+			_, serr = s.fs.SendText(ctx, s.fs.DefaultChatID(), plainMessage(title, body))
+		case model.ChannelTelegram:
+			// Telegram 那边 parse_mode 是 HTML，正文必须转义：
+			// 用户消息里出现 < 或 & 会让接口直接报 400，而报错只说「can't parse entities」。
+			_, serr = s.tg.SendMessage(ctx, s.tg.DefaultChatID(),
+				telegram.Message{Text: htmlMessage(title, body)})
+		case model.ChannelDingTalk:
+			serr = s.dg.CreateAndDeliverCard(ctx, outTrackID(0), dingtalk.BuildPushParams(title, body))
+		case model.ChannelWeCom:
+			serr = s.wc.SendMarkdown(ctx, markdownMessage(title, body))
+		}
+		res.OK = serr == nil
+		if serr != nil {
+			res.Error = serr.Error()
+			failed++
+			s.log.Warn("外部推送失败", "channel", string(ch), "title", title, "err", serr)
+		}
+		out = append(out, res)
+	}
+
+	if failed == len(out) {
+		return out, errors.New("所有渠道都没能发出去")
+	}
+	return out, nil
+}
+
+// PushTargetError 渠道选择有问题：调用方指了个不存在的渠道，或者指的那个没就绪。
+//
+// 与「渠道都试过但都没发出去」分开：这是调用方看得懂、也改得动的问题，
+// 接口应当回 400，而不是笼统的 502 让人以为服务端挂了。
+type PushTargetError struct{ msg string }
+
+func (e *PushTargetError) Error() string { return e.msg }
+
+func pushTargetErr(msg string) error { return &PushTargetError{msg: msg} }
+
+// pushTargets 决定这次推到哪些渠道。
+func (s *Service) pushTargets(want string) ([]model.Channel, error) {
+	return resolvePushChannel(want, s.readyChannels())
+}
+
+// resolvePushChannel 把调用方要的渠道映射成实际要发的那一串。
+//
+// 指名要某个渠道却没就绪时**直接报错**，不退回「发到别的渠道」：
+// 调用方看到成功就会以为消息到了它想去的那个群，错发比发不出去更麻烦。
+func resolvePushChannel(want string, ready []model.Channel) ([]model.Channel, error) {
+	want = strings.ToLower(strings.TrimSpace(want))
+	if want == "" || want == "all" {
+		if len(ready) == 0 {
+			return nil, pushTargetErr("还没有已就绪的通知渠道：请先在设置页配好并打开开关")
+		}
+		return ready, nil
+	}
+	ch := model.Channel(want)
+	if !ch.Valid() {
+		return nil, pushTargetErr(fmt.Sprintf("不认识的渠道 %q，可用：all / feishu / telegram / dingtalk / wecom", want))
+	}
+	for _, r := range ready {
+		if r == ch {
+			return []model.Channel{ch}, nil
+		}
+	}
+	return nil, pushTargetErr(fmt.Sprintf("渠道 %s 未就绪：凭据没配齐，或者开关是关的", ch))
+}
+
+// plainMessage 纯文本渠道的排版：标题一行，正文跟在后面。
+func plainMessage(title, body string) string {
+	switch {
+	case title == "":
+		return body
+	case body == "":
+		return title
+	}
+	return title + "\n" + body
+}
+
+// htmlMessage Telegram 的 parse_mode 是 HTML。
+func htmlMessage(title, body string) string {
+	if title == "" {
+		return html.EscapeString(body)
+	}
+	return "<b>" + html.EscapeString(title) + "</b>\n" + html.EscapeString(body)
+}
+
+// markdownMessage 企业微信走 markdown，标题用小标题。
+func markdownMessage(title, body string) string {
+	if title == "" {
+		return body
+	}
+	return "### " + title + "\n" + body
 }
 
 // handleCardAction 实现 feishu.ActionHandler：处理飞书卡片按钮点击。

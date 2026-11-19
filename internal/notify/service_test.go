@@ -374,3 +374,84 @@ func TestNewLoadsPersistedDingTalkChats(t *testing.T) {
 		t.Fatalf("启动后没把上次记下的会话读回来：%+v", got)
 	}
 }
+
+// 外部推送：渠道怎么选。
+//
+// 指名要某个渠道而它没就绪时必须报错，绝不能"发到别的渠道"凑数 ——
+// 调用方收到 ok 就会以为消息进了它想去的那个群。
+func TestResolvePushChannel(t *testing.T) {
+	all := []model.Channel{model.ChannelFeishu, model.ChannelTelegram}
+
+	cases := []struct {
+		want    string
+		ready   []model.Channel
+		expect  []model.Channel
+		wantErr bool
+	}{
+		{"", all, all, false},
+		{"all", all, all, false},
+		{"ALL", all, all, false},
+		{"feishu", all, []model.Channel{model.ChannelFeishu}, false},
+		{"FEISHU", all, []model.Channel{model.ChannelFeishu}, false},
+		{" feishu ", all, []model.Channel{model.ChannelFeishu}, false},
+		{"all", nil, nil, true},    // 一个渠道都没配
+		{"wecom", all, nil, true},  // 认得这个渠道，但它没就绪
+		{"wechat", all, nil, true}, // 根本不认识
+		{"smtp", all, nil, true},
+	}
+	for _, c := range cases {
+		got, err := resolvePushChannel(c.want, c.ready)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("resolvePushChannel(%q) 应当报错，却返回 %v", c.want, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("resolvePushChannel(%q) 不该报错：%v", c.want, err)
+			continue
+		}
+		if len(got) != len(c.expect) {
+			t.Errorf("resolvePushChannel(%q) = %v，期望 %v", c.want, got, c.expect)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.expect[i] {
+				t.Errorf("resolvePushChannel(%q) = %v，期望 %v", c.want, got, c.expect)
+				break
+			}
+		}
+	}
+}
+
+// 各渠道的排版：标题与正文只填一个时不能留下空行或光秃秃的标记。
+func TestPushMessageLayout(t *testing.T) {
+	if got := plainMessage("标题", "正文"); got != "标题\n正文" {
+		t.Errorf("纯文本 = %q", got)
+	}
+	if got := plainMessage("", "正文"); got != "正文" {
+		t.Errorf("没有标题时不该留空行，得到 %q", got)
+	}
+	if got := plainMessage("标题", ""); got != "标题" {
+		t.Errorf("没有正文时只发标题，得到 %q", got)
+	}
+
+	// Telegram 走 HTML parse_mode，正文里出现尖括号会让接口 400。
+	got := htmlMessage("a<b", "x & y <z>")
+	if strings.Contains(got, "<z>") || strings.Contains(got, "x & y") {
+		t.Errorf("HTML 正文没转义: %q", got)
+	}
+	if !strings.Contains(got, "&lt;z&gt;") || !strings.Contains(got, "&amp;") {
+		t.Errorf("HTML 转义不对: %q", got)
+	}
+	if !strings.Contains(got, "<b>a&lt;b</b>") {
+		t.Errorf("标题应加粗并转义: %q", got)
+	}
+
+	if got := markdownMessage("标题", "正文"); got != "### 标题\n正文" {
+		t.Errorf("企业微信 markdown = %q", got)
+	}
+	if got := markdownMessage("", "正文"); got != "正文" {
+		t.Errorf("没有标题时不该带 ###，得到 %q", got)
+	}
+}

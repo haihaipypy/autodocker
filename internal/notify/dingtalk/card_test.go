@@ -90,3 +90,29 @@ func TestTestParamsHasButtonHint(t *testing.T) {
 		t.Fatalf("回执状态 = %q", done[VarStatus])
 	}
 }
+
+// 外部推送的卡片数据：长正文必须截断。
+//
+// 钉钉对 cardParamMap 单个值限制 1KB，超了整个请求被判「param.invalid」，
+// 报错里不说是哪个变量太长 —— 用户只会看到一条发不出去的消息。
+func TestBuildPushParamsClipsLongBody(t *testing.T) {
+	long := strings.Repeat("这是一段很长的消息内容。", 200)
+	p := BuildPushParams("备份完成", long)
+	if len(p[VarBody]) > 900 {
+		t.Fatalf("正文没截到 900 字节以内，得到 %d", len(p[VarBody]))
+	}
+	if !utf8.ValidString(p[VarBody]) {
+		t.Fatal("截断把多字节字符切坏了")
+	}
+	if p[VarStatus] != "通知" {
+		t.Fatalf("状态位应固定为「通知」，得到 %q", p[VarStatus])
+	}
+	if p[VarTitle] != "备份完成" {
+		t.Fatalf("标题被改动了：%q", p[VarTitle])
+	}
+
+	// 标题空着时给个兜底：卡片上那格空着比填满更难看。
+	if got := BuildPushParams("", "正文")[VarTitle]; got == "" {
+		t.Fatal("标题为空时应补一个兜底文案")
+	}
+}

@@ -90,6 +90,23 @@ func BuildStateParams(n *model.Notification, state model.CardState, detail strin
 	}
 }
 
+// BuildPushParams 构造「外部应用推送」的卡片数据。
+//
+// 复用更新提醒那套模板变量，但不带任何版本、容器相关的字段 ——
+// 收到这张卡的人只需要知道「有个应用发来一条消息」。
+// status 那格放一个固定标签：模板里它是小角标，空着比填满更难看。
+func BuildPushParams(title, body string) CardParams {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = "消息通知"
+	}
+	return CardParams{
+		VarTitle:  clip(title, 200),
+		VarStatus: "通知",
+		VarBody:   clip(strings.TrimSpace(body), 900),
+	}
+}
+
 // BuildTestParams 构造测试卡片。
 //
 // 第一句必须讲清「发得出去」只证明了一半：卡片能收到和按钮点得动是两条

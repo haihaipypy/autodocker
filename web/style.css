@@ -1180,6 +1180,17 @@ button.pill:hover { filter: brightness(1.12); }
 .step-body { flex: 1; min-width: 0; font-size: 12.5px; line-height: 1.7; }
 .step-body > span { display: block; }
 
+/* 推送令牌：输入框占满一行，按钮跟在右边不被压扁 */
+.token-row { display: flex; gap: 8px; align-items: center; }
+.token-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  letter-spacing: .2px;
+}
+.token-row .btn { flex: 0 0 auto; }
+
 .cmd { position: relative; margin-top: 8px; }
 .cmd pre {
   margin: 0;

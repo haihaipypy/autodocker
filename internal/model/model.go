@@ -288,6 +288,13 @@ type Settings struct {
 	AdminUser     string `json:"admin_user"`
 	AdminPassword string `json:"admin_password"`
 
+	// PushToken 给本机其它应用调用 POST /api/push 用的令牌。
+	//
+	// 留空表示这个接口不存在（返回 403），必须先在设置页生成一个 ——
+	// 默认敞开的话，端口一暴露出去就是个任人使用的消息推送机。
+	// 它独立于访问密码：调用方是别的程序，不该被逼着保管管理员口令。
+	PushToken string `json:"push_token"`
+
 	// CheckUpdates 每天去 GitHub 看一眼自己有没有新版本，只提示、不自动安装。
 	// 关掉就彻底不出网 —— 有些机器在内网，不想有任何多余的外连。
 	CheckUpdates bool `json:"check_updates"`

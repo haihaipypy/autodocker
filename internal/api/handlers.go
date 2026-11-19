@@ -2,6 +2,9 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,6 +15,7 @@ import (
 
 	"github.com/haihaipypy/autodocker/internal/dockerx"
 	"github.com/haihaipypy/autodocker/internal/model"
+	"github.com/haihaipypy/autodocker/internal/notify"
 	"github.com/haihaipypy/autodocker/internal/notify/dingtalk"
 	"github.com/haihaipypy/autodocker/internal/notify/telegram"
 	"github.com/haihaipypy/autodocker/internal/notify/wecom"
@@ -806,12 +810,154 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	// 存原样的话页面上永远显示半截，看不出到底生效没有。
 	in.SelfCheckMirror = selfcheck.NormalizeMirror(in.SelfCheckMirror)
 	in.SelfCheckProxy = strings.TrimSpace(in.SelfCheckProxy)
+
+	// 推送令牌由「生成 / 撤销」两个接口单独管理，设置页保存别的字段时不会带上它；
+	// 空值直接落库等于把令牌抹掉，所有调用方一起失效，且页面不会给任何提示。
+	if in.PushToken == "" {
+		in.PushToken = s.LoadSettings().PushToken
+	}
+
 	if err := s.saveSettings(in); err != nil {
 		writeErr(w, http.StatusInternalServerError, "保存设置失败: "+err.Error())
 		return
 	}
 	s.ApplySettings(in)
 	writeOK(w, s.LoadSettings())
+}
+
+// ---- 外部推送接口 ----
+
+// pushTokenBytes 令牌的随机字节数。16 字节（32 个 hex 字符）足够：
+// 猜中概率可以忽略，复制粘贴也不至于长到让人手抄出错。
+const pushTokenBytes = 16
+
+// newPushToken 生成一个新的推送令牌。
+//
+// 必须用 crypto/rand 而不是 math/rand：这个值一旦可预测，
+// 任何能访问端口的人都能往用户的通知群里发消息。
+func newPushToken() (string, error) {
+	buf := make([]byte, pushTokenBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// handleRotatePushToken 生成或重置推送令牌，旧令牌立即失效。
+func (s *Server) handleRotatePushToken(w http.ResponseWriter, r *http.Request) {
+	tok, err := newPushToken()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "生成令牌失败: "+err.Error())
+		return
+	}
+	cfg := s.LoadSettings()
+	cfg.PushToken = tok
+	if err := s.saveSettings(cfg); err != nil {
+		writeErr(w, http.StatusInternalServerError, "保存令牌失败: "+err.Error())
+		return
+	}
+	s.log.Info("推送令牌已生成")
+	writeOK(w, map[string]any{"push_token": tok})
+}
+
+// handleRevokePushToken 撤销令牌。之后 POST /api/push 一律返回 403。
+func (s *Server) handleRevokePushToken(w http.ResponseWriter, r *http.Request) {
+	cfg := s.LoadSettings()
+	cfg.PushToken = ""
+	if err := s.saveSettings(cfg); err != nil {
+		writeErr(w, http.StatusInternalServerError, "撤销令牌失败: "+err.Error())
+		return
+	}
+	s.log.Info("推送令牌已撤销")
+	writeOK(w, map[string]any{"push_token": ""})
+}
+
+// pushIn 外部推送的请求体。
+type pushIn struct {
+	Title   string `json:"title"`
+	Body    string `json:"body"`
+	Channel string `json:"channel"`
+}
+
+// matchPushToken 判断这次请求带的令牌对不对。
+//
+// want 为空表示接口没启用 —— 这种时候一律不放行，不能因为「两边都空」
+// 就算匹配：令牌没生成时进来的任何调用都不该被当成合法。
+func matchPushToken(r *http.Request, want string) bool {
+	if want == "" {
+		return false
+	}
+	got := strings.TrimSpace(r.Header.Get("X-Push-Token"))
+	if got == "" {
+		// 也认 Authorization: Bearer，多数语言的 HTTP 客户端默认只给这个。
+		if b := strings.TrimSpace(r.Header.Get("Authorization")); len(b) > 7 && strings.EqualFold(b[:7], "bearer ") {
+			got = strings.TrimSpace(b[7:])
+		}
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// handlePush 给本机其它应用用：把一条消息推到已配好的通知渠道。
+//
+// 鉴权走独立的 X-Push-Token，不是网页那套 Basic Auth —— 调用方是别的程序，
+// 不该被逼着保管管理员口令；令牌泄了也能单独换掉，不必连口令一起改。
+func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
+	cfg := s.LoadSettings()
+	if cfg.PushToken == "" {
+		writeErr(w, http.StatusForbidden, "推送接口未启用：请先在设置页生成推送令牌")
+		return
+	}
+	if !matchPushToken(r, cfg.PushToken) {
+		writeErr(w, http.StatusUnauthorized, "推送令牌无效")
+		return
+	}
+
+	// 这个口子只传一两段文字，用不着更大的体积。
+	// 这里不走 decodeBody：那个函数开了 DisallowUnknownFields，
+	// 调用方多带一个字段（时间戳、主机名之类）就会被判「格式错误」。
+	dec := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
+	var in pushIn
+	if err := dec.Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体格式错误: "+err.Error())
+		return
+	}
+
+	title := strings.TrimSpace(in.Title)
+	body := strings.TrimSpace(in.Body)
+	if title == "" && body == "" {
+		writeErr(w, http.StatusBadRequest, "title 与 body 至少填一个")
+		return
+	}
+	if len([]rune(title)) > 200 {
+		writeErr(w, http.StatusBadRequest, "title 最多 200 字")
+		return
+	}
+	if len(body) > 8192 {
+		writeErr(w, http.StatusBadRequest, "body 最多 8192 字节")
+		return
+	}
+
+	results, err := s.nt.Push(r.Context(), notify.PushRequest{
+		Title: title, Body: body, Channel: in.Channel,
+	})
+	if results == nil {
+		results = []notify.PushResult{}
+	}
+	if err != nil {
+		// 渠道选错了是调用方能改的事（400）；选对了但一条都没发出去才是上游故障（502）。
+		// 一律回 502 会让人往「服务挂了」的方向查，实际只是自己渠道名写错了。
+		code := http.StatusBadGateway
+		var tErr *notify.PushTargetError
+		if errors.As(err, &tErr) {
+			code = http.StatusBadRequest
+		}
+		// 带上逐渠道结果：调用方要能分清「渠道没配好」和「配好了但发失败」。
+		writeJSON(w, code, map[string]any{
+			"ok": false, "error": err.Error(), "sent": results,
+		})
+		return
+	}
+	writeOK(w, map[string]any{"ok": true, "sent": results})
 }
 
 func (s *Server) handleFeishuTest(w http.ResponseWriter, r *http.Request) {

@@ -577,7 +577,6 @@ function renderNotifications() {
 //
 // 只列**已经能用**的四个。曾经在这里摆过 Slack / Discord / Gotify / ntfy / Bark / 邮件，
 // 一律标「施工中」—— 占位摆了大半年也没做，反而让人以为「是不是我没配出来」。
-// 现在明确：企业微信是最后一个渠道，以后只维护这四个。
 const CHANNELS = [
   { id: 'feishu', name: '飞书' },
   { id: 'telegram', name: 'Telegram' },
@@ -1176,6 +1175,20 @@ function renderGuide(ch) {
   guide.innerHTML = feishuGuideHtml();
 }
 
+// pushSnippet 给调用方抄的 curl 示例。
+//
+// 协议与端口跟着当前页面走：用户从哪打开的，示例里就写哪个地址 ——
+// 写死 19999 的话，改了端口或者走反代的人抄过去全是连不上。
+function pushSnippet(token) {
+  const hint = token || '<先在设置页生成令牌>';
+  return [
+    `curl -X POST ${location.origin}/api/push \\`,
+    "  -H 'Content-Type: application/json' \\",
+    `  -H 'X-Push-Token: ${hint}' \\`,
+    `  -d '{"title":"备份完成","body":"共 3.2 GB"}'`,
+  ].join('\n');
+}
+
 function renderSettings() {
   const s = state.settings;
   if (!s) return;
@@ -1210,7 +1223,6 @@ function renderSettings() {
     <h3 class="form-section">通知渠道</h3>
     <p class="field-hint">发现新版本时把提醒推到哪里。<b>开着开关、凭据齐全的渠道都会收到</b>；关掉某个渠道只是不再推新提醒，配置一项都不会丢。右栏是当前所选渠道的完整配置流程 —— 选谁只决定改哪份配置。</p>
     <div class="channel-picker">${channelChipsHtml(ch)}</div>
-    <p class="field-hint">企业微信是最后一个渠道 —— 这四个之外不再增加新的。</p>
     ${channelSwitchHtml(ch, chName)}
     ${fields}
 
@@ -1257,6 +1269,37 @@ function renderSettings() {
       <label for="admin_password">访问密码</label>
       <input id="admin_password" name="admin_password" type="password" value="${esc(s.admin_password)}" placeholder="留空表示不需要登录">
       <p class="field-hint">保存后立即生效，无需重启；留空即关闭登录。改动后本页会自动改用新凭据，不用手动重登。</p>
+    </div>
+
+    <h3 class="form-section">消息推送接口</h3>
+    <p class="field-hint">
+      本机其它应用（备份脚本、监控告警之类）可以调 <code>POST /api/push</code>，
+      把消息推到上面已经配好的渠道。调用方只需要下面这个令牌，不用保管登录密码。
+    </p>
+    <div class="field">
+      <label for="push_token">推送令牌</label>
+      <div class="token-row">
+        <input id="push_token" type="text" readonly value="${esc(s.push_token || '')}" placeholder="尚未生成，接口不可用">
+        <button type="button" class="btn ghost" id="btn-push-token">${s.push_token ? '重新生成' : '生成令牌'}</button>
+        <button type="button" class="btn ghost" id="btn-push-revoke" ${s.push_token ? '' : 'hidden'}>停用</button>
+      </div>
+      <p class="field-hint" id="push-hint">
+        ${s.push_token
+          ? '重新生成后旧令牌立即失效，正在用它的应用要同步换成新的。'
+          : '生成之后接口才可用；不生成，这个入口就不存在。'}
+      </p>
+    </div>
+    <div class="field">
+      <label>调用示例</label>
+      <div class="cmd">
+        <pre id="push-example">${esc(pushSnippet(s.push_token))}</pre>
+        <button type="button" class="btn ghost small" id="btn-copy-push">复制</button>
+      </div>
+      <p class="field-hint">
+        <code>channel</code> 填 <code>all</code>（默认）就发到所有已就绪渠道，
+        也可以只写 <code>feishu</code> / <code>telegram</code> / <code>dingtalk</code> / <code>wecom</code>。
+        指名要某个渠道而它没配好时直接报错，不会悄悄改发到别处。
+      </p>
     </div>
 
     <h3 class="form-section">更新策略</h3>
@@ -2383,6 +2426,62 @@ function renderRegistryTest(res) {  const rows = (res.results || []).map((r) => 
 
 // 逐个探测直连与各加速源。镜像全是「未知」时，这一步能把
 // 「到底是网络不通、还是 tag 不在」直接摊开，不用去猜。
+// ---- 推送令牌 ----
+
+// rotatePushToken 生成或重置推送令牌。
+//
+// 只改这一块的 DOM，不整体重渲染设置页：用户很可能还有别的字段没保存，
+// 整页重绘会把输入的内容一起清掉。
+async function rotatePushToken() {
+  const btn = $('#btn-push-token');
+  if (btn) { btn.disabled = true; btn.textContent = '生成中…'; }
+  try {
+    const r = await api('/api/push/token', { method: 'POST' });
+    if (state.settings) state.settings.push_token = r.push_token;
+    const input = $('#push_token');
+    if (input) input.value = r.push_token;
+    if (btn) btn.textContent = '重新生成';
+    const hint = $('#push-hint');
+    if (hint) hint.textContent = '重新生成后旧令牌立即失效，正在用它的应用要同步换成新的。';
+    const pre = $('#push-example');
+    if (pre) pre.textContent = pushSnippet(r.push_token);
+    const revoke = $('#btn-push-revoke');
+    if (revoke) revoke.hidden = false;
+    toast('令牌已生成，复制后填到调用方配置里');
+  } catch (e) {
+    toast(e.message, 'error');
+    if (btn) btn.textContent = state.settings && state.settings.push_token ? '重新生成' : '生成令牌';
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function revokePushToken() {
+  if (!confirm('停用后，正在调用推送接口的应用会立刻发不出去。确定？')) return;
+  try {
+    await api('/api/push/token', { method: 'DELETE' });
+    if (state.settings) state.settings.push_token = '';
+    const input = $('#push_token');
+    if (input) input.value = '';
+    const btn = $('#btn-push-token');
+    if (btn) btn.textContent = '生成令牌';
+    const revoke = $('#btn-push-revoke');
+    if (revoke) revoke.hidden = true;
+    const hint = $('#push-hint');
+    if (hint) hint.textContent = '生成之后接口才可用；不生成，这个入口就不存在。';
+    const pre = $('#push-example');
+    if (pre) pre.textContent = pushSnippet('');
+    toast('推送接口已停用');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function copyPushSnippet() {
+  const pre = $('#push-example');
+  if (!pre) return;
+  const ok = await copyText(pre.textContent);
+  toast(ok ? '示例已复制' : '复制失败，请手动选中');
+}
+
 async function testRegistry() {
   const btn = $('#btn-test-registry');
   const box = $('#registry-test-result');
@@ -2547,6 +2646,9 @@ document.addEventListener('click', async (ev) => {
   if (ev.target.id === 'btn-wc-chats') loadWeComChats();
   if (ev.target.id === 'btn-dt-check') checkDingTalk();
   if (ev.target.id === 'btn-test-registry') testRegistry();
+  if (ev.target.id === 'btn-push-token') rotatePushToken();
+  if (ev.target.id === 'btn-push-revoke') revokePushToken();
+  if (ev.target.id === 'btn-copy-push') copyPushSnippet();
   if (ev.target.id === 'btn-clean') openCleanModal();
   if (ev.target.id === 'btn-clean-ok') doClean();
   if (ev.target.id === 'btn-remove-picked') removePicked();
