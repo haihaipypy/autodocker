@@ -2,12 +2,14 @@
 package api
 
 import (
+	"bufio"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/haihaipypy/autodocker/internal/config"
 	"github.com/haihaipypy/autodocker/internal/dockerx"
+	"github.com/haihaipypy/autodocker/internal/hubserver"
 	"github.com/haihaipypy/autodocker/internal/notify"
 	"github.com/haihaipypy/autodocker/internal/registry"
 	"github.com/haihaipypy/autodocker/internal/scanner"
@@ -36,6 +39,7 @@ type Deps struct {
 	Registry *registry.Client
 	Docker   *dockerx.Client
 	Self     *selfcheck.Checker
+	Hub      *hubserver.Server
 	Logger   *slog.Logger
 }
 
@@ -49,6 +53,7 @@ type Server struct {
 	reg  *registry.Client
 	dk   *dockerx.Client
 	self *selfcheck.Checker
+	hub  *hubserver.Server
 	log  *slog.Logger
 
 	// 访问密码可以在设置页随时改，所以不能直接读 cfg —— 那是启动时定死的。
@@ -76,6 +81,7 @@ func New(d Deps) *Server {
 		reg:  d.Registry,
 		dk:   d.Docker,
 		self: d.Self,
+		hub:  d.Hub,
 		log:  d.Logger,
 	}
 	// 环境变量里的凭据只作首次启动的初值，之后以数据库里的设置为准
@@ -169,6 +175,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/selfcheck", s.handleSelfCheck)
 	mux.HandleFunc("POST /api/selfcheck", s.handleSelfCheckRun)
 
+	// 远程节点：Agent 主动连进来，Hub 只收上报与下发指令。
+	mux.HandleFunc("GET /api/agent/ws", s.hub.HandleWS)
+	// 安装脚本本身不含任何机密（Hub 地址 + 镜像名），公开可读；
+	// 生成「带令牌的完整命令」才需要登录。
+	mux.HandleFunc("GET /api/agent/install.sh", s.handleInstallScript)
+	mux.HandleFunc("GET /api/agent/binary", s.handleAgentBinary)
+	mux.HandleFunc("GET /api/nodes", s.handleListNodes)
+	mux.HandleFunc("POST /api/nodes", s.handleCreateNode)
+	mux.HandleFunc("PUT /api/nodes/{id}", s.handleUpdateNode)
+	mux.HandleFunc("DELETE /api/nodes/{id}", s.handleDeleteNode)
+	mux.HandleFunc("POST /api/nodes/{id}/token", s.handleRotateNodeToken)
+	mux.HandleFunc("POST /api/nodes/{id}/scan", s.handleNodeScan)
+	mux.HandleFunc("GET /api/nodes/{id}/containers", s.handleNodeContainers)
+	// 所有节点的容器快照，供列表页的「全部节点」视图用
+	mux.HandleFunc("GET /api/node-containers", s.handleAllNodeContainers)
+
 	mux.Handle("/", s.staticHandler())
 
 	return s.withLogging(s.withAuth(mux))
@@ -231,6 +253,15 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// Agent 的三条链路同理：WebSocket 与二进制下发用节点令牌鉴权，
+		// 安装脚本不含任何机密。这里必须精确匹配路径 ——
+		// 用前缀判断会顺手把 /api/agent/* 全放开。
+		if r.URL.Path == "/api/agent/ws" ||
+			r.URL.Path == "/api/agent/install.sh" ||
+			r.URL.Path == "/api/agent/binary" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if user == "" {
 			user = "admin"
 		}
@@ -254,6 +285,22 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
+}
+
+// Hijack 把连接交还给调用方。WebSocket 升级必须走这一步：
+// gorilla 拿到的是这层包装，如果不转发 Hijack，升级会直接失败并返回 500，
+// 而日志里只会看到「response does not implement http.Hijacker」，很容易误判成客户端的问题。
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("底层 ResponseWriter 不支持 Hijack")
+	}
+	if r.status == http.StatusOK {
+		// 升级成功后不会再写响应头，这里把状态记成 101，
+		// 否则访问日志里所有 WS 连接都会显示 200。
+		r.status = http.StatusSwitchingProtocols
+	}
+	return h.Hijack()
 }
 
 func (s *Server) withLogging(next http.Handler) http.Handler {

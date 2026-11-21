@@ -111,6 +111,27 @@ func (c *Client) Ping(ctx context.Context) error {
 	return nil
 }
 
+// HostInfo 读取守护进程所在主机的系统信息。
+//
+// 节点列表要显示「这台是群晖还是飞牛」，而这个信息只有宿主机知道 ——
+// Agent 容器里的 /etc/os-release 只会告诉你是 alpine。
+func (c *Client) HostInfo(ctx context.Context) (osName, kernel, serverVersion string, err error) {
+	var out struct {
+		OperatingSystem string `json:"OperatingSystem"`
+		OSType          string `json:"OSType"`
+		KernelVersion   string `json:"KernelVersion"`
+		ServerVersion   string `json:"ServerVersion"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/info", nil, &out); err != nil {
+		return "", "", "", fmt.Errorf("读取守护进程信息失败: %w", err)
+	}
+	osName = strings.TrimSpace(out.OperatingSystem)
+	if osName == "" {
+		osName = strings.TrimSpace(out.OSType)
+	}
+	return osName, out.KernelVersion, out.ServerVersion, nil
+}
+
 // RegistryMirrors 读取守护进程自己配置的镜像加速器。
 //
 // 对应 docker info 里的 Registry Mirrors，也就是 daemon.json 的

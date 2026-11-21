@@ -299,3 +299,106 @@ func TestUpdateImageContainerRemapsStaleID(t *testing.T) {
 		t.Fatalf("重挂后不该动引用，得到 id=%d ref=%s", got.ID, got.Reference)
 	}
 }
+
+// 「提醒过哪一版」要能落库、能被清掉，且清掉之后恢复提醒才有效。
+func TestImageNotifiedFlagsRoundTrip(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("打开测试库失败: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	id, err := s.UpsertImage(&model.Image{
+		Reference:   "gdy666/lucky:v3.6.0",
+		ContainerID: "c1",
+		Origin:      model.OriginContainer,
+		Status:      model.StatusNewTag,
+	})
+	if err != nil {
+		t.Fatalf("写入监控项失败: %v", err)
+	}
+
+	// 只写 tag：new_tag 那条路径。
+	if err := s.SetImageNotified(id, "v3.7.0", ""); err != nil {
+		t.Fatal(err)
+	}
+	img, err := s.FindImageByContainer("c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if img.NotifiedTag != "v3.7.0" || img.NotifiedDigest != "" {
+		t.Fatalf("tag 没写进去: tag=%q digest=%q", img.NotifiedTag, img.NotifiedDigest)
+	}
+
+	// 只写摘要：同 tag 内容变化那条路径。
+	if err := s.SetImageNotified(id, "", "sha256:new"); err != nil {
+		t.Fatal(err)
+	}
+	img, _ = s.FindImageByContainer("c1")
+	if img.NotifiedTag != "v3.7.0" || img.NotifiedDigest != "sha256:new" {
+		t.Fatalf("摘要没写进去: tag=%q digest=%q", img.NotifiedTag, img.NotifiedDigest)
+	}
+
+	// 「稍后提醒」清两个：少清一个，下一轮还是不会提醒。
+	if err := s.ClearImageNotified(id); err != nil {
+		t.Fatal(err)
+	}
+	img, _ = s.FindImageByContainer("c1")
+	if img.NotifiedTag != "" || img.NotifiedDigest != "" {
+		t.Fatalf("清空失败: tag=%q digest=%q", img.NotifiedTag, img.NotifiedDigest)
+	}
+}
+
+// 升级到 1.6.1 时要把老痕迹补成「已提醒」，否则第一轮扫描会把用户
+// 早就看过、甚至点过忽略的版本统统再推一遍。
+func TestBackfillNotifiedFromHistory(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("打开测试库失败: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	const ref, cid = "gdy666/lucky:v3.6.0", "c1"
+	id, err := s.UpsertImage(&model.Image{
+		Reference: ref, ContainerID: cid, ContainerName: "lucky",
+		Origin: model.OriginContainer, IgnoredDigest: "sha256:ignored",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nid, err := s.CreateNotification(&model.Notification{
+		ImageRef: ref, ContainerID: cid, ContainerName: "lucky",
+		Kind: model.NotifNewTag, LatestTag: "v3.7.0", CardState: model.CardPending,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetNotificationCardState(nid, model.CardDone); err != nil {
+		t.Fatal(err)
+	}
+	// 另一条被「稍后提醒」的记录不该被当成已经提醒过。
+	if _, err := s.CreateNotification(&model.Notification{
+		ImageRef: ref, ContainerID: cid, ContainerName: "lucky",
+		Kind: model.NotifNewTag, LatestTag: "v3.9.0", CardState: model.CardSnoozed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.backfillNotified(); err != nil {
+		t.Fatalf("回填失败: %v", err)
+	}
+	img, err := s.FindImage(ref, cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if img.NotifiedDigest != "sha256:ignored" {
+		t.Errorf("老的忽略摘要应搬过来，得到 %q", img.NotifiedDigest)
+	}
+	if img.NotifiedTag != "v3.7.0" {
+		t.Errorf("应回填最近一条有效提醒的版本，得到 %q", img.NotifiedTag)
+	}
+	if img.ID != id {
+		t.Errorf("不该动到别的行")
+	}
+}

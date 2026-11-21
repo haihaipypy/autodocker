@@ -1296,3 +1296,111 @@ button.pill:hover { filter: brightness(1.12); }
   * { transition: none !important; }
   .stat:hover { transform: none; }
 }
+
+/* ---------- 远程节点 ---------- */
+
+/* 节点列表不走 .table-wrap：每台机器是一张独立卡片，能展开，
+   用整块表格反而会让展开后的层级关系看不出来。 */
+
+.nodes-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.node-form {
+  margin-bottom: 16px;
+  padding: 16px;
+  background: var(--surface);
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.node-form-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.node-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1 1 240px;
+  font-size: 12px;
+  color: var(--text-sub);
+}
+
+.node-field .input { width: 100%; }
+
+.node-form .hint {
+  margin: 10px 0 0;
+  line-height: 1.65;
+}
+
+.node-form-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.node-cmd {
+  margin: 0 0 10px;
+  padding: 12px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: all;
+}
+
+.node-card {
+  background: var(--surface);
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.node-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  cursor: pointer;
+  transition: background .16s ease;
+}
+
+.node-head:hover { background: var(--surface-hover); }
+
+/* 三个操作按钮比容器表的两个宽，固定 158px 会挤成一团 */
+.node-head .cell.actions { flex: 0 0 auto; }
+.node-head .cell.actions .btn { opacity: .75; }
+.node-head:hover .cell.actions .btn { opacity: 1; }
+
+.node-detail {
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+.node-containers .row {
+  padding: 10px 16px 10px 28px;
+  background: transparent;
+  border-bottom: 1px solid var(--border);
+}
+
+.node-containers .row:last-child { border-bottom: none; }
+
+/* 节点页的合计紧跟在标题后面。默认的 space-between 会把它顶到页面中间，
+   看起来像是和「添加节点」并列的第二个按钮。 */
+#panel-nodes .panel-head .hint { margin-right: auto; }

@@ -70,13 +70,25 @@ type Image struct {
 	// 它与 Ignored 是两种粒度：Ignored 是「这个监控项我整个不要了」，
 	// 一旦置位就不再查远端；IgnoredDigest 只针对**某一个版本**，
 	// 远端摘要不变就不再打扰，仓库一旦推了新内容（摘要变了）照常通知。
-	IgnoredDigest string    `json:"ignored_digest"`
-	Status        Status    `json:"status"`
-	BaselineAt    time.Time `json:"baseline_at"` // 首次纳入监控的时间
-	LastCheckedAt time.Time `json:"last_checked_at"`
-	LastError     string    `json:"last_error"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	IgnoredDigest string `json:"ignored_digest"`
+	// NotifiedTag / NotifiedDigest 记录「上一轮到底提醒过哪一版」。
+	//
+	// 去重不能再依赖通知记录本身：用户把已读历史清掉之后，那条记录就没了，
+	// 扫描器会认为「从没提醒过」，于是同一版本每隔一轮就再推一次 —— 这正是
+	// 「忽略或移除的提醒总是又出现」的根因。把「提醒过哪一版」记在监控项上，
+	// 删历史只是删展示，不影响这个判断。
+	//
+	// 两个字段分别对应两种更新：NotifiedTag 用于「仓库出了更高版本 tag」，
+	// NotifiedDigest 用于「同一个 tag 的内容变了」。仓库真推了新内容时，
+	// 对应的值必然不同，照常提醒。
+	NotifiedTag    string    `json:"notified_tag"`
+	NotifiedDigest string    `json:"notified_digest"`
+	Status         Status    `json:"status"`
+	BaselineAt     time.Time `json:"baseline_at"` // 首次纳入监控的时间
+	LastCheckedAt  time.Time `json:"last_checked_at"`
+	LastError      string    `json:"last_error"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // LocalImage 是「镜像」标签页上的一行：本机真实存在的镜像，
@@ -227,6 +239,80 @@ type Scan struct {
 	Notified   int       `json:"notified"`
 	Forced     bool      `json:"forced"`
 	Error      string    `json:"error"`
+}
+
+// NodeStatus 远程节点的在线状态。
+type NodeStatus string
+
+const (
+	// NodeNever 已经生成过安装命令，但从来没连上来过。
+	NodeNever NodeStatus = "never"
+	// NodeOnline 心跳正常。
+	NodeOnline NodeStatus = "online"
+	// NodeOffline 连过，但心跳超时了。
+	NodeOffline NodeStatus = "offline"
+)
+
+// Node 一台被监控的远程机器。
+//
+// 它不存任何「容器状态」——那是 NodeContainer 的事。这里只有身份与连通性：
+// 是谁、装的时候填的哪个地址、Agent 什么版本、最后一次心跳在什么时候。
+// 把这些和容器数据分开，是因为节点掉线时要显示的恰恰是「最后已知状态 + 已掉线」，
+// 两类信息混在一张表里会让人分不清哪个是实时值。
+type Node struct {
+	ID     int64  `json:"id"`
+	Name   string `json:"name"`
+	HubURL string `json:"hub_url"` // 生成安装命令时用户填的 Hub 地址
+	Note   string `json:"note"`
+	// 以下由 Agent 注册时上报
+	Hostname     string     `json:"hostname"`
+	OS           string     `json:"os"`
+	Arch         string     `json:"arch"`
+	AgentVersion string     `json:"agent_version"`
+	Protocol     int        `json:"protocol"`
+	Status       NodeStatus `json:"status"`
+	LastSeenAt   time.Time  `json:"last_seen_at"`
+	// LastReportAt 最近一次收到容器快照的时间。零值表示「连上了但还没交过卷」——
+	// 页面据此显示巡检中，而不是把「还没有数据」显示成「没有容器」。
+	LastReportAt time.Time `json:"last_report_at"`
+	// 统计值，查询时现算，不落库
+	ContainerCount int       `json:"container_count"`
+	UpdateCount    int       `json:"update_count"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+// NodeContainer 远程节点上报的一条容器观测值。
+//
+// 字段与 Image 高度重合是有意的：判定逻辑在 Agent 上跑，Hub 只是把它看到的东西
+// 原样收下来展示。所以这里不带 size_bytes / image_created 这类「只有本机才用得上」
+// 的信息，也不参与任何本地操作。
+type NodeContainer struct {
+	NodeID        int64       `json:"node_id"`
+	ContainerID   string      `json:"container_id"`
+	ContainerName string      `json:"container_name"`
+	ImageRef      string      `json:"image_ref"`
+	ImageID       string      `json:"image_id"`
+	LocalTag      string      `json:"local_tag"`
+	LocalDigest   string      `json:"local_digest"`
+	RemoteDigest  string      `json:"remote_digest"`
+	LatestTag     string      `json:"latest_tag"`
+	Aliases       []string    `json:"aliases"`
+	Origin        ImageOrigin `json:"origin"`
+	Status        Status      `json:"status"`
+	Mode          DetectMode  `json:"mode"`
+	Ignored       bool        `json:"ignored"`
+	LastError     string      `json:"last_error"`
+	CheckedAt     time.Time   `json:"checked_at"`
+}
+
+// NodeContainerView 列表页要的一行：快照 + 节点名。
+//
+// 单独一个结构而不是把 NodeName 塞进 NodeContainer，是因为 NodeContainer 是
+// Agent 上报的原始形状，多一个字段就得在协议里也留着它 —— 而节点名是 Hub 侧
+// 自己知道的，没必要让 Agent 重复上报。
+type NodeContainerView struct {
+	NodeContainer
+	NodeName string `json:"node_name"`
 }
 
 // Settings 可在线调整的运行时设置。

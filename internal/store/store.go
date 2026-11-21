@@ -68,6 +68,8 @@ func (s *Store) migrate() error {
 			mode_override   INTEGER NOT NULL DEFAULT 0,
 			ignored         INTEGER NOT NULL DEFAULT 0,
 			ignored_digest  TEXT    NOT NULL DEFAULT '',
+			notified_tag    TEXT    NOT NULL DEFAULT '',
+			notified_digest TEXT    NOT NULL DEFAULT '',
 			status          TEXT    NOT NULL DEFAULT 'unknown',
 			baseline_at     INTEGER NOT NULL DEFAULT 0,
 			last_checked_at INTEGER NOT NULL DEFAULT 0,
@@ -138,6 +140,51 @@ func (s *Store) migrate() error {
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL DEFAULT ''
 		)`,
+
+		// 远程节点。token_hash 存 sha256，明文只在生成安装命令时展示一次。
+		`CREATE TABLE IF NOT EXISTS nodes (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			name          TEXT    NOT NULL DEFAULT '',
+			hub_url       TEXT    NOT NULL DEFAULT '',
+			note          TEXT    NOT NULL DEFAULT '',
+			token_hash    TEXT    NOT NULL DEFAULT '',
+			hostname      TEXT    NOT NULL DEFAULT '',
+			os            TEXT    NOT NULL DEFAULT '',
+			arch          TEXT    NOT NULL DEFAULT '',
+			agent_version TEXT    NOT NULL DEFAULT '',
+			protocol      INTEGER NOT NULL DEFAULT 0,
+			status        TEXT    NOT NULL DEFAULT 'never',
+			last_seen_at  INTEGER NOT NULL DEFAULT 0,
+			last_report_at INTEGER NOT NULL DEFAULT 0,
+			created_at    INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_token ON nodes(token_hash)`,
+
+		// 远端节点的容器快照。每轮上报全量替换，不做增量 diff：
+		// 增量合并要处理「容器被删了」「改名字了」「镜像换了」一堆边界，
+		// 而一次上报本来就只有几十 KB，全量替换是最不容易出错的做法。
+		`CREATE TABLE IF NOT EXISTS node_containers (
+			node_id        INTEGER NOT NULL,
+			container_id   TEXT    NOT NULL,
+			container_name TEXT    NOT NULL DEFAULT '',
+			image_ref      TEXT    NOT NULL DEFAULT '',
+			image_id       TEXT    NOT NULL DEFAULT '',
+			local_tag      TEXT    NOT NULL DEFAULT '',
+			local_digest   TEXT    NOT NULL DEFAULT '',
+			remote_digest  TEXT    NOT NULL DEFAULT '',
+			latest_tag     TEXT    NOT NULL DEFAULT '',
+			aliases        TEXT    NOT NULL DEFAULT '',
+			origin         TEXT    NOT NULL DEFAULT '',
+			status         TEXT    NOT NULL DEFAULT '',
+			mode           TEXT    NOT NULL DEFAULT '',
+			ignored        INTEGER NOT NULL DEFAULT 0,
+			last_error     TEXT    NOT NULL DEFAULT '',
+			checked_at     INTEGER NOT NULL DEFAULT 0
+		)`,
+		// 普通索引即可，绝不能建成唯一索引：镜像维度的条目（本机闲置镜像、
+		// 纯远端盯梢）容器编号是空串，一条上报里有两个这样的条目就撞唯一约束，
+		// 整份快照插入失败、事务回滚 —— 节点页上永远显示 0 个容器。
+		`CREATE INDEX IF NOT EXISTS idx_node_containers_node ON node_containers(node_id)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -160,6 +207,10 @@ var imageAddedColumns = []struct{ name, ddl string }{
 	{"dangling", "INTEGER NOT NULL DEFAULT 0"},
 	// 用户在飞书卡片上「忽略本版本」时记下的远端摘要，见 model.Image.IgnoredDigest。
 	{"ignored_digest", "TEXT NOT NULL DEFAULT ''"},
+	// 「上一轮提醒过哪一版」。没有这两列时，去重只能靠通知记录本身，
+	// 用户清一次已读历史，同一版本就会重新冒出来。
+	{"notified_tag", "TEXT NOT NULL DEFAULT ''"},
+	{"notified_digest", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // notificationAddedColumns 是 1.2.4 起为 notifications 表新增的列。
@@ -181,7 +232,44 @@ func (s *Store) addMissingColumns() error {
 	if err := s.addImageColumns(); err != nil {
 		return err
 	}
+	if err := s.addNodeColumns(); err != nil {
+		return err
+	}
 	return s.addNotificationColumns()
+}
+
+// nodeAddedColumns 是 1.7.5 起为 nodes 表新增的列。
+//
+// last_report_at 记「最近一次真正收到快照的时间」，和心跳是两个概念：
+// 心跳只证明连着，快照才证明这台机器上的容器数据是最新的。页面上
+// 「在线但还没收到过快照」要显示成巡检中，而不是一个会误导人的 0。
+var nodeAddedColumns = []struct{ name, ddl string }{
+	{"last_report_at", "INTEGER NOT NULL DEFAULT 0"},
+}
+
+func (s *Store) addNodeColumns() error {
+	have, err := s.tableColumns("nodes")
+	if err != nil {
+		return err
+	}
+	for _, col := range nodeAddedColumns {
+		if have[col.name] {
+			continue
+		}
+		if _, err := s.db.Exec("ALTER TABLE nodes ADD COLUMN " + col.name + " " + col.ddl); err != nil {
+			return fmt.Errorf("补列 %s 失败: %w", col.name, err)
+		}
+	}
+	// 1.7.5 之前 node_containers 上建的是 (node_id, container_id) 唯一索引。
+	// 镜像维度那条没有容器编号（空串），一份上报里出现两个就违反约束，
+	// 整份快照写不进去 —— 节点页一直显示 0 个容器。这里把旧索引删掉换成普通索引。
+	if _, err := s.db.Exec(`DROP INDEX IF EXISTS idx_node_containers`); err != nil {
+		return fmt.Errorf("删除旧的快照唯一索引失败: %w", err)
+	}
+	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_node_containers_node ON node_containers(node_id)`); err != nil {
+		return fmt.Errorf("重建快照索引失败: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) addImageColumns() error {
@@ -190,6 +278,10 @@ func (s *Store) addImageColumns() error {
 		return err
 	}
 	needBackfill := !have["origin"]
+	// 这两个列是 1.6.1 才有的。只在「这次刚补上」时回填一次：
+	// 每次都跑的话，用户点过「恢复提醒」（把标记清空）后重启一次又被填回来，
+	// 恢复就成了摆设。
+	needNotifyBackfill := !have["notified_tag"]
 	for _, col := range imageAddedColumns {
 		if have[col.name] {
 			continue
@@ -206,6 +298,39 @@ func (s *Store) addImageColumns() error {
 		); err != nil {
 			return fmt.Errorf("回填来源失败: %w", err)
 		}
+	}
+	if needNotifyBackfill {
+		if err := s.backfillNotified(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// backfillNotified 把「已经提醒过哪一版」从旧的痕迹里补出来。
+//
+// 不回填的后果是：升级后第一轮扫描会认为所有更新都没提醒过，把用户早就看过、
+// 甚至点过忽略的版本统统再推一遍。刚说「修好了不再重复」，转头就刷一屏旧提醒。
+func (s *Store) backfillNotified() error {
+	// 老的「忽略本版本」只记了摘要，直接搬过去。
+	if _, err := s.db.Exec(
+		`UPDATE images SET notified_digest = ignored_digest WHERE notified_digest = '' AND ignored_digest != ''`,
+	); err != nil {
+		return fmt.Errorf("回填已提醒摘要失败: %w", err)
+	}
+	// 更高版本 tag 的那一路只留了通知记录，取最近一条仍有效的。
+	// 排除 snoozed：那是用户明确要求「下次再说」，不该被当成已经提醒过。
+	if _, err := s.db.Exec(`
+		UPDATE images SET notified_tag = COALESCE((
+			SELECT n.latest_tag FROM notifications n
+			WHERE n.image_ref = images.reference
+			  AND n.container_id = images.container_id
+			  AND n.latest_tag <> ''
+			  AND n.card_state <> 'snoozed'
+			ORDER BY n.created_at DESC
+			LIMIT 1
+		), '') WHERE notified_tag = ''`); err != nil {
+		return fmt.Errorf("回填已提醒版本失败: %w", err)
 	}
 	return nil
 }

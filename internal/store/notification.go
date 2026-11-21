@@ -142,12 +142,16 @@ func (s *Store) FindPendingNotification(imageRef, containerID string) (*model.No
 	return &n, nil
 }
 
-// HasNotificationForTag 判断某个具体版本 tag 是否已经通知过（用于 pin-watch 去重）。
+// HasNotificationForTag 判断某个具体版本 tag 是否已经通知过。
+//
+// 排除 snoozed：那是用户点了「稍后提醒」，语义是「下次巡检再提我一遍」。
+// 把它算成「已经通知过」，那张卡片就会变成最后一次提醒，之后再无消息。
 func (s *Store) HasNotificationForTag(imageRef, containerID, tag string) (bool, error) {
 	var n int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM notifications WHERE image_ref = ? AND container_id = ? AND latest_tag = ?`,
-		imageRef, containerID, tag,
+		`SELECT COUNT(*) FROM notifications WHERE image_ref = ? AND container_id = ? AND latest_tag = ?
+			AND card_state <> ?`,
+		imageRef, containerID, tag, string(model.CardSnoozed),
 	).Scan(&n)
 	if err != nil {
 		return false, err

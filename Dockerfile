@@ -41,11 +41,16 @@ ENV TZ=Asia/Shanghai \
 EXPOSE 17777
 VOLUME ["/data"]
 
-# 探针打静态首页，不打 /api/health —— 后者在配了 ADMIN_PASSWORD 时需要鉴权，
-# 一旦用户设了密码就会一直 401，容器被误判成不健康。
-# 用 ${PORT} 而不是写死端口，否则用户改了端口健康检查必然失败。
+# 探针分两种角色：Hub 打静态首页，Agent 只检查进程还活着。
+#
+# Agent 模式一个端口都不监听（这是它的核心设计：目标机不用开任何端口），
+# 所以探针绝不能去连 HTTP —— 否则容器会一直显示 unhealthy，
+# 用户看到那条红字会以为装坏了。
+#
+# 首页用 ${PORT} 而不是写死端口，否则用户改了端口健康检查必然失败。
+# 不打 /api/health：配了 ADMIN_PASSWORD 之后那个接口要鉴权，会一直 401。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD wget -q -O /dev/null "http://127.0.0.1:${PORT:-17777}/" || exit 1
+    CMD sh -c 'if [ "$AUTODOCKER_MODE" = "agent" ]; then kill -0 1 2>/dev/null; else wget -q -O /dev/null "http://127.0.0.1:${PORT:-17777}/"; fi'
 
 ENTRYPOINT ["/app/autodocker"]
 

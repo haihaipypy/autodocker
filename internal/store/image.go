@@ -17,6 +17,7 @@ var ErrNotFound = errors.New("记录不存在")
 const imageCols = `id, reference, container_id, container_name, origin, image_id, size_bytes,
 	image_created, dangling, local_digest, remote_digest,
 	local_tag, latest_tag, aliases, mode, mode_override, ignored, ignored_digest, status,
+	notified_tag, notified_digest,
 	baseline_at, last_checked_at, last_error, created_at, updated_at`
 
 type rowScanner interface {
@@ -38,6 +39,7 @@ func scanImage(sc rowScanner) (model.Image, error) {
 		&img.Origin, &img.ImageID, &img.SizeBytes, &img.ImageCreated, &dangling,
 		&img.LocalDigest, &img.RemoteDigest, &img.LocalTag, &img.LatestTag,
 		&aliasesJSON, &img.Mode, &modeOverride, &ignored, &img.IgnoredDigest, &img.Status,
+		&img.NotifiedTag, &img.NotifiedDigest,
 		&baselineAt, &lastChecked, &img.LastError, &createdAt, &updatedAt,
 	)
 	if err != nil {
@@ -98,8 +100,9 @@ func (s *Store) UpsertImage(img *model.Image) (int64, error) {
 			reference, container_id, container_name, origin, image_id, size_bytes,
 			image_created, dangling, local_digest, remote_digest,
 			local_tag, latest_tag, aliases, mode, mode_override, ignored, ignored_digest, status,
+			notified_tag, notified_digest,
 			baseline_at, last_checked_at, last_error, created_at, updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(reference, container_id) DO UPDATE SET
 			container_name  = excluded.container_name,
 			origin          = excluded.origin,
@@ -119,6 +122,7 @@ func (s *Store) UpsertImage(img *model.Image) (int64, error) {
 		img.SizeBytes, img.ImageCreated, b2i(img.Dangling), img.LocalDigest, img.RemoteDigest,
 		img.LocalTag, img.LatestTag, string(aliases), img.Mode, b2i(img.ModeOverride), b2i(img.Ignored),
 		img.IgnoredDigest, img.Status,
+		img.NotifiedTag, img.NotifiedDigest,
 		timeToTs(img.BaselineAt), timeToTs(img.LastCheckedAt), img.LastError, timeToTs(img.CreatedAt), timeToTs(img.UpdatedAt),
 	).Scan(&id)
 	if err != nil {
@@ -338,8 +342,8 @@ func (s *Store) UpdateImageCheck(id int64, status model.Status, remoteDigest, la
 
 // SetImageIgnored 设置忽略标记。
 //
-// 恢复监控时连 ignored_digest 一起清掉：那个字段记的是「用户已放行的某次远端内容」，
-// 用户既然要重新收提醒，就不该再被它压着。
+// 恢复监控时把三个「这一版已经处理过」的标记一起清掉：用户既然要重新收提醒，
+// 就不该再被它们压着。少清任何一个，恢复按钮都会变成「点了没反应」。
 func (s *Store) SetImageIgnored(id int64, ignored bool) error {
 	status := model.StatusUnknown
 	if ignored {
@@ -350,8 +354,41 @@ func (s *Store) SetImageIgnored(id int64, ignored bool) error {
 			b2i(ignored), string(status), timeToTs(time.Now()), id)
 		return err
 	}
-	_, err := s.db.Exec(`UPDATE images SET ignored = ?, ignored_digest = '', status = ?, updated_at = ? WHERE id = ?`,
+	_, err := s.db.Exec(`UPDATE images SET ignored = ?, ignored_digest = '',
+			notified_tag = '', notified_digest = '', status = ?, updated_at = ? WHERE id = ?`,
 		b2i(ignored), string(status), timeToTs(time.Now()), id)
+	return err
+}
+
+// SetImageNotified 记下「这一版已经提醒过了」。
+//
+// 调用点在发出通知之后，而不是在用户点按钮之后：判断「还要不要提醒」看的应该是
+// 「有没有说过」，不是「用户有没有表态」。这样把通知历史清掉也不会让旧提醒复活。
+//
+// 两个标记按更新类型各写一个，另一个传空串保持原样 —— 两种更新不会同时发生，
+// 互相覆盖反而会让「上一条还在待处理的提醒」失去抑制。
+func (s *Store) SetImageNotified(id int64, tag, digest string) error {
+	if tag != "" && digest != "" {
+		_, err := s.db.Exec(`UPDATE images SET notified_tag = ?, notified_digest = ?, updated_at = ? WHERE id = ?`,
+			tag, digest, timeToTs(time.Now()), id)
+		return err
+	}
+	if tag != "" {
+		_, err := s.db.Exec(`UPDATE images SET notified_tag = ?, updated_at = ? WHERE id = ?`,
+			tag, timeToTs(time.Now()), id)
+		return err
+	}
+	_, err := s.db.Exec(`UPDATE images SET notified_digest = ?, updated_at = ? WHERE id = ?`,
+		digest, timeToTs(time.Now()), id)
+	return err
+}
+
+// ClearImageNotified 清掉「已提醒过」标记，让下一轮扫描重新提醒。
+//
+// 只给「稍后提醒」用：用户明确说了下次再说，这里还压着就等于永不提醒。
+func (s *Store) ClearImageNotified(id int64) error {
+	_, err := s.db.Exec(`UPDATE images SET notified_tag = '', notified_digest = '', updated_at = ? WHERE id = ?`,
+		timeToTs(time.Now()), id)
 	return err
 }
 

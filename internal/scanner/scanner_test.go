@@ -98,3 +98,161 @@ func TestNotifySuppressesOnlyIgnoredDigest(t *testing.T) {
 		t.Error("远端内容已变化时应重新推送通知")
 	}
 }
+
+// 清空通知历史之后，同一版本不能再冒出来。
+//
+// 这是 issue 里「移除的提醒总是又出现」的直接复现：去重原先只认通知记录，
+// 用户点一次「清除已读」，记录就没了，下一轮扫描认为「从没提醒过」，
+// 于是把同一个 v3.7.0 再推一遍 —— 点几次都清不掉。
+func TestNotifySurvivesNotificationCleanup(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("打开测试库失败: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	sc := &Scanner{st: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	ctx := context.Background()
+	const ref, cid = "gdy666/lucky:v3.6.0", "c1"
+
+	if _, err := st.UpsertImage(&model.Image{
+		Reference: ref, ContainerID: cid, ContainerName: "lucky",
+		Origin: model.OriginContainer, LocalTag: "v3.6.0",
+		LatestTag: "v3.7.0", Status: model.StatusNewTag,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	img, err := st.FindImage(ref, cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !sc.notify(ctx, img, model.NotifNewTag, false) {
+		t.Fatal("第一轮应当推送提醒")
+	}
+
+	// 用户看过之后清空历史 —— 这一步正是「提醒又出现」的触发动作。
+	if err := st.MarkAllRead(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DeleteReadNotifications(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 重新读一遍，模拟下一轮扫描（标记是落库的，内存里那份不会自己变）。
+	img, err = st.FindImage(ref, cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sc.notify(ctx, img, model.NotifNewTag, false) {
+		t.Error("通知历史清空后不该重发同一版本")
+	}
+
+	// 仓库真的出了更高版本，照常提醒。
+	img.LatestTag = "v3.8.0"
+	if !sc.notify(ctx, img, model.NotifNewTag, false) {
+		t.Error("出现更高的版本时应重新推送")
+	}
+}
+
+// 「稍后提醒」必须真的能再提一次。
+//
+// 抑制标记写在监控项上之后，稍后提醒就不能只改卡片状态了：
+// 不清标记的话，下一轮会认为「这一版说过了」，卡片上那句
+// 「下次巡检会重新推送」就成了空话。
+func TestNotifyResumesAfterSnooze(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("打开测试库失败: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	sc := &Scanner{st: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	ctx := context.Background()
+	const ref, cid = "gdy666/lucky:v3.6.0", "c2"
+
+	imgID, err := st.UpsertImage(&model.Image{
+		Reference: ref, ContainerID: cid, ContainerName: "lucky",
+		Origin: model.OriginContainer, LocalTag: "v3.6.0",
+		LatestTag: "v3.7.0", Status: model.StatusNewTag,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := st.FindImage(ref, cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !sc.notify(ctx, img, model.NotifNewTag, false) {
+		t.Fatal("第一轮应当推送提醒")
+	}
+	pending, err := st.FindPendingNotification(ref, cid)
+	if err != nil {
+		t.Fatalf("应能找到刚推送的提醒: %v", err)
+	}
+
+	// 用户在卡片上点「稍后提醒」：改状态 + 清标记。
+	if err := st.SetNotificationCardState(pending.ID, model.CardSnoozed); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ClearImageNotified(imgID); err != nil {
+		t.Fatal(err)
+	}
+	img, err = st.FindImage(ref, cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !sc.notify(ctx, img, model.NotifNewTag, false) {
+		t.Error("设为稍后之后，下一轮应当重新推送")
+	}
+}
+
+// 用户点过「恢复提醒」之后，同一版本应当重新推送。
+func TestNotifyResumesAfterIgnoredReset(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("打开测试库失败: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	sc := &Scanner{st: st, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	ctx := context.Background()
+	const ref, cid = "gdy666/lucky:v3.6.0", "c3"
+
+	imgID, err := st.UpsertImage(&model.Image{
+		Reference: ref, ContainerID: cid, ContainerName: "lucky",
+		Origin: model.OriginContainer, LocalTag: "v3.6.0",
+		LatestTag: "v3.7.0", Status: model.StatusNewTag,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetImageNotified(imgID, "v3.7.0", ""); err != nil {
+		t.Fatal(err)
+	}
+	img, err := st.FindImage(ref, cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sc.notify(ctx, img, model.NotifNewTag, false) {
+		t.Fatal("已提醒过的版本不该重发")
+	}
+
+	// 「恢复提醒」＝ 解除忽略，标记必须一起清掉，否则按钮点了没反应。
+	if err := st.SetImageIgnored(imgID, false); err != nil {
+		t.Fatal(err)
+	}
+	img, err = st.FindImage(ref, cid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if img.NotifiedTag != "" || img.NotifiedDigest != "" {
+		t.Fatalf("恢复提醒后标记应清空，得到 tag=%q digest=%q", img.NotifiedTag, img.NotifiedDigest)
+	}
+	if !sc.notify(ctx, img, model.NotifNewTag, false) {
+		t.Error("恢复提醒后应当重新推送")
+	}
+}

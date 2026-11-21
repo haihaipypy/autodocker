@@ -8,9 +8,24 @@ import (
 	"time"
 )
 
+// 运行角色。
+const (
+	// ModeServe 默认角色：提供网页、自己巡检、统一发通知。
+	ModeServe = "serve"
+	// ModeAgent 被监控端：不监听端口、不开网页，主动连 Hub、只上报。
+	ModeAgent = "agent"
+)
+
 // Config 汇集全部运行时配置。所有项都可由环境变量覆盖，
 // 环境变量仅作为首次启动的初值，之后以数据库中的设置为准。
 type Config struct {
+	// 运行角色与 Hub 连接（仅 Agent 模式使用）
+	Mode       string
+	HubURL     string // 生成安装命令时填的地址，形如 https://hub.example.com
+	NodeToken  string // 节点令牌明文，只在安装时出现一次
+	NodeName   string // 显示名，缺省由 hostname 决定
+	AgentImage string // 安装脚本里用的镜像，留空用默认标签
+
 	// 基础
 	Port      int
 	DBPath    string
@@ -77,6 +92,11 @@ type Config struct {
 // Load 从环境变量装载配置。
 func Load() (*Config, error) {
 	c := &Config{
+		Mode:                    strings.ToLower(envStr("AUTODOCKER_MODE", ModeServe)),
+		HubURL:                  strings.TrimRight(envStr("AUTODOCKER_HUB", ""), "/"),
+		NodeToken:               envStr("AUTODOCKER_TOKEN", ""),
+		NodeName:                envStr("AUTODOCKER_NODE_NAME", ""),
+		AgentImage:              envStr("AUTODOCKER_AGENT_IMAGE", ""),
 		Port:                    envInt("PORT", 17777),
 		DBPath:                  envStr("DB_PATH", "/data/autodocker.db"),
 		StaticDir:               envStr("STATIC_DIR", "./web"),
@@ -121,6 +141,25 @@ func Load() (*Config, error) {
 
 	if c.Port <= 0 || c.Port > 65535 {
 		return nil, fmt.Errorf("PORT 非法: %d", c.Port)
+	}
+	switch c.Mode {
+	case ModeServe, ModeAgent:
+	default:
+		return nil, fmt.Errorf("AUTODOCKER_MODE 只能是 %s 或 %s: %s", ModeServe, ModeAgent, c.Mode)
+	}
+	// Agent 模式下这两项缺一个都没法工作，宁可启动即失败 ——
+	// 让容器带着错配置跑起来、然后一直重连，比直接报错难查得多，
+	// 用户只会看到「装好了但 Hub 里没有」。
+	if c.Mode == ModeAgent {
+		if c.HubURL == "" {
+			return nil, fmt.Errorf("Agent 模式必须配置 AUTODOCKER_HUB（Hub 的访问地址）")
+		}
+		if !strings.HasPrefix(c.HubURL, "http://") && !strings.HasPrefix(c.HubURL, "https://") {
+			return nil, fmt.Errorf("AUTODOCKER_HUB 必须以 http:// 或 https:// 开头: %s", c.HubURL)
+		}
+		if c.NodeToken == "" {
+			return nil, fmt.Errorf("Agent 模式必须配置 AUTODOCKER_TOKEN（节点令牌）")
+		}
 	}
 	if c.ScanInterval > 0 && c.ScanInterval < 30*time.Second {
 		c.ScanInterval = 30 * time.Second

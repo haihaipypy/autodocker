@@ -1134,10 +1134,10 @@ func (s *Service) applyAction(n *model.Notification, action string, from model.C
 			s.log.Warn("更新通知状态失败", "err", err)
 		}
 		_ = s.st.MarkNotificationRead(n.ID, true)
-		// 光把这条通知标成「已忽略」是拦不住下一条消息的：扫描只看远端摘要变没变，
+		// 光把这条通知标成「已忽略」是拦不住下一条消息的：扫描只看远端内容变没变，
 		// 下一轮照样判成「有更新」并新建一条通知。必须把「用户已放行这一版」
 		// 记到监控项上，消息里那句「同一个版本不会再次提醒」才是真的。
-		s.rememberIgnoredDigest(n)
+		s.rememberIgnored(n)
 		return actionOutcome{
 			Toast:  "已忽略该版本",
 			State:  model.CardIgnored,
@@ -1147,6 +1147,14 @@ func (s *Service) applyAction(n *model.Notification, action string, from model.C
 	case ActionSnooze:
 		if err := s.st.SetNotificationCardState(n.ID, model.CardSnoozed); err != nil {
 			s.log.Warn("更新通知状态失败", "err", err)
+		}
+		// 「稍后提醒」靠清掉「已提醒过」标记实现：不清的话下一轮扫描会认为
+		// 这一版早说过了，那张卡片就成了最后一次提醒，卡片上写的
+		// 「下次巡检会重新推送」变成空话。
+		if img := s.findImageForNotification(n); img != nil {
+			if err := s.st.ClearImageNotified(img.ID); err != nil {
+				s.log.Warn("清除已提醒标记失败", "err", err)
+			}
 		}
 		return actionOutcome{
 			Toast:  "已设为稍后",
@@ -1187,13 +1195,30 @@ func (s *Service) applyAction(n *model.Notification, action string, from model.C
 // 「现在仓库里这一版」，以最新观测为准更稳妥（期间要是又推了一版，下一轮该提醒还得提醒）。
 // 记录失败不影响回调返回 —— 按钮已经点了，消息状态也改了，这里只是尽力而为，
 // 真失败了顶多下次再被提醒一遍。
-func (s *Service) rememberIgnoredDigest(n *model.Notification) {
-	if n.ContainerID == "" {
+// rememberIgnored 把「用户放行了这一版」记到监控项上。
+//
+// 两种更新的记法不一样：更高版本 tag 记在 notified_tag，同 tag 内容变化记在
+// ignored_digest。按 kind 分流，别混着写 —— new_tag 场景手上只有旧 tag 的
+// 摘要，拿它当「已放行的内容」会把后面真正的更新一并压掉。
+func (s *Service) rememberIgnored(n *model.Notification) {
+	img := s.findImageForNotification(n)
+	if img == nil {
+		s.log.Warn("找不到对应的监控项，无法记录已忽略版本",
+			"ref", n.ImageRef, "container", n.ContainerID)
 		return
 	}
-	img, err := s.st.FindImage(n.ImageRef, n.ContainerID)
-	if err != nil {
-		s.log.Warn("读取监控项失败，无法记录已忽略版本", "ref", n.ImageRef, "err", err)
+	if n.Kind == model.NotifNewTag && n.LatestTag != "" {
+		if err := s.st.SetImageNotified(img.ID, n.LatestTag, ""); err != nil {
+			s.log.Warn("记录已忽略版本失败", "ref", n.ImageRef, "err", err)
+		}
+		// 摘要也照写：页面上那个「已忽略本版本」徽章与「恢复提醒」按钮
+		// 都靠它判断。少了这一步，用户点完忽略回到列表里还是「有更新」，
+		// 只会以为按钮没生效，再点第二次。
+		if img.RemoteDigest != "" {
+			if err := s.st.SetImageIgnoredDigest(img.ID, img.RemoteDigest); err != nil {
+				s.log.Warn("记录已忽略摘要失败", "ref", n.ImageRef, "err", err)
+			}
+		}
 		return
 	}
 	if img.RemoteDigest == "" {
@@ -1202,6 +1227,23 @@ func (s *Service) rememberIgnoredDigest(n *model.Notification) {
 	if err := s.st.SetImageIgnoredDigest(img.ID, img.RemoteDigest); err != nil {
 		s.log.Warn("记录已忽略版本失败", "ref", n.ImageRef, "err", err)
 	}
+}
+
+// findImageForNotification 找出这条通知对应的监控项。
+//
+// 不能只按 (reference, container_id) 精确查：升级到更高版本 tag 之后，那一行的
+// reference 已经换成新引用，而通知里存的还是发通知时的旧引用，精确查必然扑空。
+// 扑空在这里的表现是「点了忽略，下一轮又提醒」，既不报错也不好查。
+func (s *Service) findImageForNotification(n *model.Notification) *model.Image {
+	if img, err := s.st.FindImage(n.ImageRef, n.ContainerID); err == nil {
+		return img
+	}
+	if n.ContainerID != "" {
+		if img, err := s.st.FindImageByContainer(n.ContainerID); err == nil {
+			return img
+		}
+	}
+	return nil
 }
 
 // TriggerUpdate 创建并异步执行一次更新任务，返回任务 ID。

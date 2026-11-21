@@ -18,6 +18,13 @@ const state = {
   picked: new Set(),
   // 自检结果：当前版本、有没有新版本、更新内容与两套升级步骤
   self: null,
+  // 远程节点
+  nodes: [],
+  nodesOnline: 0,
+  // 展开的节点 id → 该节点最近的容器快照。
+  // 按需拉取而不是随每次轮询全量取：节点多了之后「全部容器」是个大响应，
+  // 而用户同一时刻通常只看一台。
+  nodeOpen: new Map(),
 };
 
 /* ---------- 登录态 ---------- */
@@ -571,6 +578,318 @@ function renderNotifications() {
       </div>
     </div>
   `).join('');
+}
+
+/* ---------- 远程节点 ---------- */
+
+// 节点状态与容器状态是两件事：前者讲「这台机器连不连得上」，
+// 后者讲「它上面的容器该不该更新」。混用一套颜色会让人把「离线」
+// 误读成「没更新」。
+const NODE_STATUS = {
+  online: { text: '在线', cls: 'ok' },
+  offline: { text: '离线', cls: 'warn' },
+  never: { text: '未连接', cls: 'muted' },
+};
+
+// 判断一个时间字段到底有没有值。
+//
+// Go 的零值时间序列化成 "0001-01-01T00:00:00Z"，在 JS 里是 truthy ——
+// 直接写 `if (v)` 会把「从未发生过」当成 0001 年 1 月 1 日显示出来。
+function hasTime(v) {
+  return !!v && String(v).slice(0, 4) !== '0001';
+}
+
+function renderNodes() {
+  const box = $('#nodes-body');
+  if (!box) return;
+
+  // 顶部那排统计卡只数本机 —— 装上远程节点之后，那里会一直是 0，
+  // 容易让人以为整个系统没有待更新项。所以在这里单独给一行合计，
+  // 把口径摆明：本机和远端分开算，各自都不含糊。
+  const summary = $('#nodes-summary');
+  if (summary) {
+    if (!state.nodes.length) {
+      summary.textContent = '';
+    } else {
+      const total = state.nodes.reduce((n, x) => n + (x.container_count || 0), 0);
+      const upd = state.nodes.reduce((n, x) => n + (x.update_count || 0), 0);
+      summary.textContent = `${state.nodesOnline} / ${state.nodes.length} 台在线 · 合计 ${total} 个容器 · ${upd} 项待更新`;
+    }
+  }
+
+  if (!state.nodes.length) {
+    box.innerHTML = '<div class="empty">还没有远程节点。点右上角「添加节点」，把生成的命令粘到目标机上执行一次即可。</div>';
+    return;
+  }
+
+  box.innerHTML = state.nodes.map((n) => {
+    const st = NODE_STATUS[n.status] || NODE_STATUS.never;
+    const open = state.nodeOpen.has(n.id);
+    const list = state.nodeOpen.get(n.id);
+    // 心跳只证明连着，快照才证明容器数据是新的。刚装好、或巡检正跑第一轮时
+    // 快照还没到，这时候显示 0 会让人以为这台机器空着。
+    const pending = n.status === 'online' && !hasTime(n.last_report_at);
+    const meta = [n.hostname, n.os, n.agent_version ? 'Agent ' + n.agent_version : '']
+      .filter(Boolean).join(' · ');
+    const detail = open
+      ? `<div class="node-detail">${list === null
+        ? '<div class="empty">正在读取…</div>'
+        : (pending && !list.length ? '<div class="empty">正在巡检，结果稍后自动出现。</div>' : nodeContainerRows(list))}</div>`
+      : '';
+    return `
+    <div class="node-card">
+      <div class="node-head" data-node-toggle="${n.id}">
+        <div class="cell grow">
+          <div class="cell-main">
+            ${esc(n.name || '未命名节点')}
+            <span class="badge ${st.cls}">${st.text}</span>
+          </div>
+          <div class="cell-sub">${esc(meta || '尚未上报信息')}</div>
+          <div class="cell-sub mono">${esc(n.hub_url || '—')}</div>
+        </div>
+        <div class="cell col-tag">
+          <div class="cell-sub">容器</div>
+          <div class="cell-main">${pending
+            ? '<span class="hint-text" title="已连上，正在跑第一轮巡检">巡检中…</span>'
+            : (n.container_count || 0)}</div>
+        </div>
+        <div class="cell col-tag">
+          <div class="cell-sub">待更新</div>
+          <div class="cell-main">${pending ? '—' : (n.update_count ? `<span class="badge warn">${n.update_count}</span>` : '0')}</div>
+        </div>
+        <div class="cell col-time">
+          <div class="cell-sub">最后心跳</div>
+          <div class="cell-main">${hasTime(n.last_seen_at) ? fmtTime(n.last_seen_at) : '—'}</div>
+        </div>
+        <div class="cell actions">
+          <button class="btn small ghost" data-node-scan="${n.id}" ${n.status === 'online' ? '' : 'disabled'}>立即巡检</button>
+          <button class="btn small ghost" data-node-token="${n.id}">重发命令</button>
+          <button class="btn small ghost danger" data-node-del="${n.id}">删除</button>
+        </div>
+      </div>
+      ${detail}
+    </div>`;
+  }).join('');
+}
+
+// nodeContainerRows 渲染某台机器上的容器。
+//
+// 只列容器维度的项（origin=container）：镜像维度那几条（本机存在但没人用的镜像、
+// 纯远端盯梢）在节点页没有操作入口，摆出来只会让人以为它们也能在这里更新。
+function nodeContainerRows(list) {
+  const items = (list || []).filter((c) => c.origin === 'container');
+  if (!items.length) return '<div class="empty">这台机器上除 Agent 自身外没有其它容器。</div>';
+  return `<div class="node-containers">${items.map((c) => `
+    <div class="row">
+      <div class="cell grow">
+        <div class="cell-main">${esc(c.container_name || '—')}</div>
+        <div class="cell-sub">${esc(c.image_ref)}</div>
+        ${c.last_error ? `<div class="cell-err" title="${esc(c.last_error)}">${esc(shortErr(c.last_error))}</div>` : ''}
+      </div>
+      <div class="cell col-tag">
+        <div class="cell-sub">当前</div>
+        <div class="cell-main mono">${esc(c.local_tag || '—')}</div>
+      </div>
+      <div class="cell col-tag">
+        <div class="cell-sub">可用</div>
+        <div class="cell-main mono">${esc(c.latest_tag || (c.status === 'update_available' ? '内容已更新' : '—'))}</div>
+      </div>
+      <div class="cell col-mode">${badge(STATUS, c.status)}</div>
+    </div>`).join('')}</div>`;
+}
+
+async function loadNodes() {
+  const data = await api('/api/nodes');
+  state.nodes = data.nodes || [];
+  state.nodesOnline = data.online || 0;
+  renderNodes();
+}
+
+// refreshNodes 手动刷新节点列表。
+//
+// 自动轮询在空闲时要隔好几轮才做一次全量刷新，刚在目标机上装完 Agent
+// 的人等不了那几十秒；这个按钮让「装完立刻回来看」有明确的动作可做。
+async function refreshNodes(opts) {
+  const quiet = !!(opts && opts.quiet);
+  const btn = $('#btn-refresh-nodes');
+  const label = btn ? btn.textContent : '';
+  if (btn && !quiet) {
+    btn.disabled = true;
+    btn.textContent = '刷新中…';
+  }
+  try {
+    await loadNodes();
+    if (!quiet) toast('已刷新');
+  } catch (e) {
+    if (!quiet) toast('刷新失败：' + e.message, 'danger');
+  } finally {
+    if (btn && !quiet) {
+      btn.disabled = false;
+      btn.textContent = label || '刷新';
+    }
+  }
+}
+
+async function toggleNode(id) {
+  if (state.nodeOpen.has(id)) {
+    state.nodeOpen.delete(id);
+    renderNodes();
+    return;
+  }
+  // 先放 null 占位，界面立刻展开并显示「正在读取」，
+  // 而不是点一下没反应、等接口回来才突然弹出来。
+  state.nodeOpen.set(id, null);
+  renderNodes();
+  try {
+    const data = await api(`/api/nodes/${id}/containers`);
+    state.nodeOpen.set(id, data.containers || []);
+  } catch (e) {
+    state.nodeOpen.set(id, []);
+    toast('读取节点容器失败：' + e.message, 'danger');
+  }
+  renderNodes();
+}
+
+function openNodeForm() {
+  const form = $('#node-form');
+  if (!form) return;
+  form.hidden = false;
+  $('#node-result').hidden = true;
+  $('#node-result').innerHTML = '';
+  resetNodeCreateButton();
+  // 预填当前访问地址：从哪儿打开的这个页面，多半就是目标机能访问到的地址。
+  // 用户可以直接改，不强制。
+  const hub = $('#node-hub');
+  if (!hub.value) {
+    try { hub.value = location.origin; } catch (_) { /* 某些内嵌浏览器不给 origin */ }
+  }
+  $('#node-name').focus();
+}
+
+function closeNodeForm() {
+  const form = $('#node-form');
+  if (form) form.hidden = true;
+  resetNodeCreateButton();
+}
+
+// 生成过命令之后就把「生成」按住，避免用户重复点出第二个同名节点。
+// 想再建一个先关掉这个表单（取消）再重新打开。
+function markNodeCommandShown() {
+  const btn = $('#btn-node-create');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '已生成命令';
+  }
+}
+
+function resetNodeCreateButton() {
+  const btn = $('#btn-node-create');
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = '生成安装命令';
+  }
+}
+
+// showNodeCommand 展示安装命令。extra 是给表单下方追加的一行补充说明，
+// 只在「新建节点」这条路径上传 —— 重发令牌时按钮状态不同，说的是另一回事。
+function showNodeCommand(command, extra) {
+  const box = $('#node-result');
+  if (!box) return;
+  box.hidden = false;
+  box.innerHTML = `
+    <div class="hint" style="margin:10px 0 6px">在目标机上执行这一条命令。令牌只显示这一次，关掉后就拿不回来了。</div>
+    <pre class="node-cmd">${esc(command)}</pre>
+    <button class="btn small" data-copy-node-cmd>复制命令</button>
+    ${extra ? `<div class="hint" style="margin:10px 0 0">${esc(extra)}</div>` : ''}`;
+}
+
+async function copyNodeCommand() {
+  const pre = $('#node-result .node-cmd');
+  if (!pre) return;
+  const ok = await copyText(pre.textContent);
+  // 复制回落路径（execCommand）在某些浏览器上静默失败，必须给明确结果，
+  // 否则用户以为粘走了，到目标机上执行的是上一份东西。
+  toast(ok ? '安装命令已复制' : '复制失败，请手动选中命令', ok ? 'ok' : 'warn');
+}
+
+async function createNode() {
+  const name = ($('#node-name').value || '').trim();
+  const hub = ($('#node-hub').value || '').trim();
+  if (!name) {
+    toast('请填写节点名称', 'warn');
+    return;
+  }
+  if (!/^https?:\/\//i.test(hub)) {
+    toast('Hub 访问地址要以 http:// 或 https:// 开头', 'warn');
+    return;
+  }
+  const btn = $('#btn-node-create');
+  btn.disabled = true;
+  btn.textContent = '生成中…';
+  let created = false;
+  try {
+    const res = await api('/api/nodes', {
+      method: 'POST',
+      body: JSON.stringify({ name, hub_url: hub }),
+    });
+    created = true;
+    showNodeCommand(res.command, '要再添加一台机器，点「取消」关掉这个表单再重新打开。');
+    // 命令只在这一刻存在。按钮留着不禁用的话，用户很容易再点一次，
+    // 于是多出一个同名节点和一条永远用不上的旧令牌。
+    markNodeCommandShown();
+  } catch (e) {
+    toast('创建失败：' + e.message, 'danger');
+  } finally {
+    // 节点其实已经建好了，只是刷新列表失败，不能提示「创建失败」，
+    // 也不能把按钮放开——那样用户会再建一个重复节点。
+    if (!created) resetNodeCreateButton();
+  }
+  if (created) {
+    try {
+      await loadNodes();
+    } catch (_) { /* 列表下一轮轮询会补上，不影响命令本身 */ }
+  }
+}
+
+async function nodeScan(id) {
+  const n = state.nodes.find((x) => x.id === id);
+  try {
+    await api(`/api/nodes/${id}/scan`, { method: 'POST' });
+    toast(`已通知「${n ? n.name : '节点'}」巡检，结果稍后自动刷新`);
+  } catch (e) {
+    toast('无法巡检：' + e.message, 'danger');
+  }
+}
+
+async function rotateNodeToken(id) {
+  if (!confirm('重新生成令牌会让这个节点立刻掉线，必须在目标机上重跑一次新命令。继续？')) return;
+  try {
+    const res = await api(`/api/nodes/${id}/token`, { method: 'POST' });
+    const n = state.nodes.find((x) => x.id === id);
+    openNodeForm();
+    if (n) {
+      $('#node-name').value = n.name || '';
+      if (n.hub_url) $('#node-hub').value = n.hub_url;
+    }
+    showNodeCommand(res.command);
+    markNodeCommandShown();
+    toast('新令牌已生成，旧令牌已失效');
+  } catch (e) {
+    toast('生成失败：' + e.message, 'danger');
+  }
+}
+
+async function deleteNode(id) {
+  const n = state.nodes.find((x) => x.id === id);
+  if (!confirm(`删除节点「${n ? n.name : ''}」？目标机上的 Agent 容器不会自动卸载。`)) return;
+  try {
+    await api(`/api/nodes/${id}`, { method: 'DELETE' });
+    state.nodeOpen.delete(id);
+    toast('已删除');
+    await loadNodes();
+  } catch (e) {
+    toast('删除失败：' + e.message, 'danger');
+  }
 }
 
 // 通知渠道清单。
@@ -1606,7 +1925,7 @@ async function loadSettings() {
 async function refresh(opts) {
   const quiet = !!(opts && opts.quiet);
   try {
-    await Promise.all([loadStats(), loadContainers(), loadImages(), loadTasks(), loadNotifications(), loadSelfCheck()]);
+    await Promise.all([loadStats(), loadContainers(), loadImages(), loadTasks(), loadNotifications(), loadSelfCheck(), loadNodes()]);
   } catch (e) {
     // 轮询触发的刷新失败不提示：局域网抖一下是常事，下一轮自己会好，
     // 每隔几秒弹一次红条反而比数据旧一会儿更烦人。
@@ -2507,7 +2826,7 @@ async function testRegistry() {
   }
 }
 
-const TABS = ['containers', 'images', 'tasks', 'notifications', 'settings'];
+const TABS = ['containers', 'nodes', 'images', 'tasks', 'notifications', 'settings'];
 
 // 标签页写进 hash，刷新后还能停在原来那一页
 function initialTab() {
@@ -2528,6 +2847,10 @@ function switchTab(name) {
     const cur = location.hash || location.pathname;
     if (cur !== want) history.replaceState(null, '', want);
   } catch (_) { /* 某些内嵌浏览器禁用 history，忽略即可 */ }
+
+  // 切到节点页时补刷一次：节点在别的机器上装好后，用户的第一反应是切过来看，
+  // 这里不该让他等定时轮询。静默刷，不弹提示。
+  if (name === 'nodes') refreshNodes({ quiet: true });
 }
 
 /* ---------- 事件绑定 ---------- */
@@ -2544,6 +2867,33 @@ document.addEventListener('click', async (ev) => {
   if (ev.target.closest('[data-close-modal]')) {
     closeCleanModal();
     closeUpdateModal();
+    return;
+  }
+
+  // 节点相关。按钮放在 node-head 里，而 node-head 本身带展开动作，
+  // 所以这几个分支必须排在「点整行」之前，否则点按钮会连带展开/收起。
+  if (ev.target.closest('#btn-add-node')) { openNodeForm(); return; }
+  if (ev.target.closest('#btn-refresh-nodes')) { refreshNodes(); return; }
+  if (ev.target.closest('#btn-node-cancel')) { closeNodeForm(); return; }
+  if (ev.target.closest('#btn-node-create')) { createNode(); return; }
+
+  const nScan = ev.target.closest('[data-node-scan]');
+  if (nScan) { nodeScan(Number(nScan.dataset.nodeScan)); return; }
+
+  const nTok = ev.target.closest('[data-node-token]');
+  if (nTok) { rotateNodeToken(Number(nTok.dataset.nodeToken)); return; }
+
+  const nDel = ev.target.closest('[data-node-del]');
+  if (nDel) { deleteNode(Number(nDel.dataset.nodeDel)); return; }
+
+  if (ev.target.closest('[data-copy-node-cmd]')) {
+    copyNodeCommand();
+    return;
+  }
+
+  const nToggle = ev.target.closest('[data-node-toggle]');
+  if (nToggle && !ev.target.closest('button')) {
+    toggleNode(Number(nToggle.dataset.nodeToggle));
     return;
   }
 
@@ -2739,6 +3089,13 @@ async function pollTick() {
 
     idleTicks = (idleTicks + 1) % IDLE_FULL_EVERY;
     if (idleTicks === 0) await refresh({ quiet: true });
+
+    // 停在节点页、又有节点还没交过巡检结果时自己盯着点。
+    // 否则「巡检中…」会一直挂在那儿，用户只能手动点刷新才看得到结果。
+    if (state.tab === 'nodes'
+      && state.nodes.some((n) => n.status === 'online' && !hasTime(n.last_report_at))) {
+      await refreshNodes({ quiet: true });
+    }
   } catch (_) {
     // 网络抖一下就跳过这一轮，下一轮自己会好
   } finally {

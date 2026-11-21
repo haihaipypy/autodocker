@@ -157,3 +157,51 @@ func TestUpdateTargetPrefersStoredLatestTag(t *testing.T) {
 		t.Fatalf("同版本不同写法应保持原引用，得到 %q", got)
 	}
 }
+
+// 升级到更高 tag 之后，通知里记的还是发通知时的旧引用。
+//
+// 只按 (引用, 容器号) 精确查必然扑空 —— 而这里扑空不会报错，只会让
+// 「记下用户放行的这一版」整段跳过，下一轮扫描照样提醒。表现就是
+// 「点了忽略，过一会儿又冒出来」，和 issue 里描述的一模一样。
+func TestFindImageForNotificationFallsBackToContainer(t *testing.T) {
+	s, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("打开测试库失败: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	svc := &Service{st: s}
+
+	// 监控项已经改成新引用（重建成功后 UpdateImageAfterRebuild 干的）。
+	id, err := s.UpsertImage(&model.Image{
+		Reference:     "gdy666/lucky:v3.7.0",
+		ContainerID:   "c1",
+		ContainerName: "lucky",
+		Origin:        model.OriginContainer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 通知里是旧引用：精确查扑空，必须按容器号找回来。
+	n := &model.Notification{ImageRef: "gdy666/lucky:v3.6.0", ContainerID: "c1"}
+	img := svc.findImageForNotification(n)
+	if img == nil {
+		t.Fatal("引用对不上时应按容器号找回监控项")
+	}
+	if img.ID != id {
+		t.Fatalf("找回的是另一行: %d != %d", img.ID, id)
+	}
+
+	// 纯远端（WATCH）项没有容器号，只能靠引用精确命中。
+	watchID, err := s.UpsertImage(&model.Image{
+		Reference: "ghcr.io/foo/bar:1.0",
+		Origin:    model.OriginWatch,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := svc.findImageForNotification(&model.Notification{ImageRef: "ghcr.io/foo/bar:1.0"})
+	if got == nil || got.ID != watchID {
+		t.Fatal("纯远端项应按引用命中")
+	}
+}

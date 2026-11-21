@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -16,6 +17,8 @@ import (
 	"github.com/haihaipypy/autodocker/internal/api"
 	"github.com/haihaipypy/autodocker/internal/config"
 	"github.com/haihaipypy/autodocker/internal/dockerx"
+	"github.com/haihaipypy/autodocker/internal/hub"
+	"github.com/haihaipypy/autodocker/internal/hubserver"
 	"github.com/haihaipypy/autodocker/internal/model"
 	"github.com/haihaipypy/autodocker/internal/notify"
 	"github.com/haihaipypy/autodocker/internal/notify/feishu"
@@ -39,7 +42,19 @@ func run() error {
 		return err
 	}
 
-	logger := newLogger(cfg.LogLevel)
+	// Agent 模式下把日志同时接进环形缓冲，随每次上报送到 Hub。
+	// 目标机通常没有 SSH，出问题时唯一的线索就是这几十行。
+	//
+	// 注意这里是「攒一个 writer 列表再展开」，而不是直接传 *hub.Ring 的 nil：
+	// 一个 nil 的具体类型指针装进 io.Writer 接口后并不等于 nil，
+	// MultiWriter 会把它当有效 writer 调下去，然后在 Write 里空指针崩溃。
+	var logRing *hub.Ring
+	var logWriters []io.Writer
+	if cfg.Mode == config.ModeAgent {
+		logRing = hub.NewRing(200)
+		logWriters = append(logWriters, logRing)
+	}
+	logger := newLogger(cfg.LogLevel, logWriters...)
 
 	if dir := filepath.Dir(cfg.DBPath); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -75,35 +90,18 @@ func run() error {
 	}
 	cancelPing()
 
-	// 守护进程若已经配好镜像加速器就沿用它。
-	//
-	// 飞牛上 Docker 拉得动镜像，多半正是靠 daemon.json 里的 registry-mirrors；
-	// 而本服务查 digest 是自己发 HTTP 请求，不会继承那份配置，
-	// 于是很容易出现「镜像能拉、检测全是未知」。这里主动对齐一次。
-	if strings.TrimSpace(cfg.RegistryMirror) == "" {
-		mctx, cancelMirror := context.WithTimeout(ctx, 10*time.Second)
-		mirrors, merr := dk.RegistryMirrors(mctx)
-		cancelMirror()
-		if merr == nil && len(mirrors) > 0 {
-			cfg.RegistryMirror = strings.Join(mirrors, ",")
-			logger.Info("已沿用 Docker 守护进程的镜像加速器", "mirrors", mirrors)
-		}
-	}
-
-	// 用户没填、守护进程也没配，就走内置默认。
-	//
-	// 放在这一层兜底而不是写进 config 的默认值里，是为了保住上面「沿用守护进程」
-	// 那条路 —— 直接给环境变量塞默认值会让守护进程的配置永远轮不到，属倒退。
-	if strings.TrimSpace(cfg.RegistryMirror) == "" {
-		cfg.RegistryMirror = registry.DefaultMirror
-		logger.Info("未配置镜像加速器，使用内置默认", "mirrors", registry.DefaultMirror)
-	}
+	alignRegistryMirror(ctx, cfg, dk, logger)
 
 	reg := registry.New(registry.Options{
 		Mirrors:  registry.ParseMirrors(cfg.RegistryMirror),
 		Insecure: cfg.RegistryInsecure,
 		Auth:     cfg.RegistryAuth,
 	})
+
+	// 被监控端到此为止：往下都是网页、通知、自检，Agent 一个都不要。
+	if cfg.Mode == config.ModeAgent {
+		return runAgent(ctx, cfg, logger, st, dk, reg, logRing)
+	}
 
 	fs := feishu.New(feishu.Config{
 		AppID:     cfg.FeishuAppID,
@@ -134,6 +132,12 @@ func run() error {
 	}, logger)
 	sc.SetNotifier(nt)
 
+	// 远程节点接入点。Hub 只收上报、下发指令，判定逻辑在 Agent 那边。
+	hubsrv := hubserver.New(hubserver.Config{
+		Version:      selfcheck.Version,
+		ScanInterval: int(cfg.ScanInterval / time.Second),
+	}, st, logger)
+
 	srv := api.New(api.Deps{
 		Cfg:      cfg,
 		Store:    st,
@@ -143,6 +147,7 @@ func run() error {
 		Registry: reg,
 		Docker:   dk,
 		Self:     self,
+		Hub:      hubsrv,
 		Logger:   logger,
 	})
 	// 以持久化设置为准（环境变量只作首次启动的初值）。
@@ -244,7 +249,70 @@ func configHints(s model.Settings) string {
 	return strings.Join(problems, "；")
 }
 
-func newLogger(level string) *slog.Logger {
+// alignRegistryMirror 让「查 digest 用的加速器」与守护进程保持一致。
+//
+// 飞牛上 Docker 拉得动镜像，多半正是靠 daemon.json 里的 registry-mirrors；
+// 而本服务查 digest 是自己发 HTTP 请求，不会继承那份配置，
+// 于是很容易出现「镜像能拉、检测全是未知」。这里主动对齐一次。
+//
+// 放在这一层兜底而不是写进 config 的默认值里，是为了保住「沿用守护进程」
+// 那条路 —— 直接给环境变量塞默认值会让守护进程的配置永远轮不到，属倒退。
+func alignRegistryMirror(ctx context.Context, cfg *config.Config, dk *dockerx.Client, logger *slog.Logger) {
+	if strings.TrimSpace(cfg.RegistryMirror) == "" {
+		mctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		mirrors, merr := dk.RegistryMirrors(mctx)
+		cancel()
+		if merr == nil && len(mirrors) > 0 {
+			cfg.RegistryMirror = strings.Join(mirrors, ",")
+			logger.Info("已沿用 Docker 守护进程的镜像加速器", "mirrors", mirrors)
+		}
+	}
+	if strings.TrimSpace(cfg.RegistryMirror) == "" {
+		cfg.RegistryMirror = registry.DefaultMirror
+		logger.Info("未配置镜像加速器，使用内置默认", "mirrors", registry.DefaultMirror)
+	}
+}
+
+// runAgent 是被监控端的全部逻辑：巡检 → 上报 → 等指令。
+//
+// 这里刻意不建 HTTP 服务、不建通知渠道、不跑自检 ——
+// Agent 不开任何端口，通知统一由 Hub 发。目标机上它等于一个不存在的东西。
+func runAgent(ctx context.Context, cfg *config.Config, logger *slog.Logger,
+	st *store.Store, dk *dockerx.Client, reg *registry.Client, ring *hub.Ring) error {
+
+	actx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	sc := scanner.New(dk, reg, st, scanner.Options{
+		ExtraWatch:      cfg.Watch,
+		SelfContainer:   cfg.SelfContainer,
+		SelfContainerID: cfg.SelfContainerID,
+		Concurrency:     4,
+		// Agent 只上报容器：镜像维度在这台机器上没有任何展示入口，
+		// 而它的检测是串行的，访问不了 Docker Hub 的机器上能耗掉几十分钟。
+		SkipImages: true,
+	}, logger)
+	// 刻意不注入 notifier：Agent 只上报，通知统一由 Hub 发。
+	// scanner.notify() 在 notifier 为 nil 时只落库不推送，正好是这个语义。
+
+	hc := hub.New(hub.Config{
+		HubURL:       cfg.HubURL,
+		Token:        cfg.NodeToken,
+		NodeName:     cfg.NodeName,
+		Version:      selfcheck.Version,
+		ScanInterval: cfg.ScanInterval,
+	}, sc, st, dk, logger, ring)
+
+	logger.Info("AutoDocker Agent 已启动",
+		"version", selfcheck.Version,
+		"hub", cfg.HubURL,
+		"node", cfg.NodeName,
+		"scan_interval", cfg.ScanInterval.String())
+
+	return hc.Run(actx)
+}
+
+func newLogger(level string, extra ...io.Writer) *slog.Logger {
 	var lv slog.Level
 	switch strings.ToLower(strings.TrimSpace(level)) {
 	case "debug":
@@ -256,6 +324,20 @@ func newLogger(level string) *slog.Logger {
 	default:
 		lv = slog.LevelInfo
 	}
-	handler := slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lv})
+
+	var w io.Writer = os.Stdout
+	if len(extra) > 0 {
+		writers := []io.Writer{os.Stdout}
+		for _, e := range extra {
+			if e != nil {
+				writers = append(writers, e)
+			}
+		}
+		if len(writers) > 1 {
+			w = io.MultiWriter(writers...)
+		}
+	}
+
+	handler := slog.NewTextHandler(w, &slog.HandlerOptions{Level: lv})
 	return slog.New(handler)
 }

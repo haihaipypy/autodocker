@@ -87,6 +87,7 @@
 
 <nav class="tabs">
   <button class="tab active" data-tab="containers">容器</button>
+  <button class="tab" data-tab="nodes">节点</button>
   <button class="tab" data-tab="images">镜像</button>
   <button class="tab" data-tab="tasks">更新历史</button>
   <button class="tab" data-tab="notifications">通知</button>
@@ -102,6 +103,41 @@
       </div>
     </div>
     <div id="containers-body" class="table-wrap"></div>
+  </section>
+
+  <section id="panel-nodes" class="panel">
+    <div class="panel-head">
+      <h2>远程节点</h2>
+      <span id="nodes-summary" class="hint"></span>
+      <div class="panel-head-right">
+        <button id="btn-refresh-nodes" class="btn ghost">刷新</button>
+        <button id="btn-add-node" class="btn">添加节点</button>
+      </div>
+    </div>
+
+    <div id="node-form" class="node-form" hidden>
+      <div class="node-form-grid">
+        <label class="node-field">
+          <span>节点名称</span>
+          <input id="node-name" class="input" placeholder="群晖 / 香港VPS" maxlength="40">
+        </label>
+        <label class="node-field">
+          <span>Hub 访问地址</span>
+          <input id="node-hub" class="input" placeholder="http://192.168.2.10:19999">
+        </label>
+      </div>
+      <p class="hint">
+        填<strong>目标机访问本服务</strong>用的地址。同一个局域网填内网 IP，外网填公网域名或隧道地址。
+        生成之后这个地址就固定了，填错只能删掉节点重新添加。
+      </p>
+      <div class="node-form-actions">
+        <button id="btn-node-create" class="btn primary">生成安装命令</button>
+        <button id="btn-node-cancel" class="btn ghost">取消</button>
+      </div>
+      <div id="node-result" hidden></div>
+    </div>
+
+    <div id="nodes-body" class="nodes-list"></div>
   </section>
 
   <section id="panel-images" class="panel">

@@ -34,6 +34,14 @@ type Options struct {
 	SelfContainer     string
 	SelfContainerID   string
 	Concurrency       int
+
+	// SkipImages 只扫容器维度，跳过「本机没被使用的镜像」。
+	//
+	// Agent（被监控端）必须打开：远端节点页只展示容器，镜像是纯白费。
+	// 这段检测是串行的，且每个 tag 都要访问一次 registry —— 在访问
+	// Docker Hub 需要走代理的机器上，几十个镜像能拖上几十分钟，
+	// 而这期间 Hub 一条数据都收不到（上报在整轮扫完之后）。
+	SkipImages bool
 }
 
 // Result 单个镜像的检测结果。
@@ -72,12 +80,16 @@ func (s *Scanner) SetNotifier(n Notifier) {
 }
 
 // SetOptions 热更新扫描配置。
+//
+// SkipImages 不跟着一起换：它标的是「这是个被监控端」，属于角色而不是配置，
+// 设置页每次保存都会重建这份 Options，带不上的话会把 Agent 打回全量巡检。
 func (s *Scanner) SetOptions(opt Options) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if opt.Concurrency <= 0 {
 		opt.Concurrency = 4
 	}
+	opt.SkipImages = s.opt.SkipImages
 	s.opt = opt
 }
 
@@ -124,6 +136,9 @@ func (s *Scanner) Scan(ctx context.Context, force bool) (*model.Scan, error) {
 		live = append(live, c.ID)
 		targets = append(targets, c)
 	}
+	// 巡检可能跑几分钟（每个镜像都要问一次 registry），而 Agent 只有
+	// 整轮结束才上报 —— 一行「开始」能让远端日志说清它到底卡在哪一步。
+	s.log.Info("开始巡检", "containers", len(targets), "skip_images", opt.SkipImages)
 
 	var (
 		wg         sync.WaitGroup
@@ -155,10 +170,16 @@ func (s *Scanner) Scan(ctx context.Context, force bool) (*model.Scan, error) {
 
 	// 镜像维度：本机存在但没有任何容器在用的镜像，加上 WATCH 的纯远端项。
 	// 这一步必须放在容器之后 —— 判断「某个镜像有没有被使用」要靠容器列表。
-	iTotal, iUpdate, iNotified := s.checkImageTargets(ctx, opt, targets, force)
-	total += iTotal
-	withUpdate += iUpdate
-	notified += iNotified
+	//
+	// Agent 模式下整段跳过：它只负责把容器现状报给 Hub，节点页也只展示容器。
+	// 而这段是串行的、每个 tag 都要访问 registry —— 在需要代理才能连上
+	// Docker Hub 的机器上，几十个闲置镜像足以把首轮巡检拖到几十分钟。
+	if !opt.SkipImages {
+		iTotal, iUpdate, iNotified := s.checkImageTargets(ctx, opt, targets, force)
+		total += iTotal
+		withUpdate += iUpdate
+		notified += iNotified
+	}
 
 	// 清理已消失容器的监控项
 	if _, derr := s.st.DeleteImagesMissing(live); derr != nil {
@@ -168,6 +189,7 @@ func (s *Scanner) Scan(ctx context.Context, force bool) (*model.Scan, error) {
 	if err := s.st.FinishScan(scanID, total, withUpdate, notified, ""); err != nil {
 		s.log.Warn("写入扫描结果失败", "err", err)
 	}
+	s.log.Info("巡检完成", "total", total, "updates", withUpdate)
 	sc, _ := s.st.GetScanByID(scanID)
 	return sc, nil
 }
@@ -495,6 +517,8 @@ func (s *Scanner) checkImageTarget(ctx context.Context, t imageTarget, force boo
 	// 得手动补上已放行的摘要，notify 才能判断「这一版用户是不是已经放行了」。
 	if existing != nil {
 		img.IgnoredDigest = existing.IgnoredDigest
+		img.NotifiedTag = existing.NotifiedTag
+		img.NotifiedDigest = existing.NotifiedDigest
 	}
 	kind := model.NotifNewVersion
 	if status == model.StatusNewTag {
@@ -547,6 +571,10 @@ func (s *Scanner) upsertImage(existing *model.Image, c dockerx.Container, ref re
 		// 带上「已放行的远端摘要」，否则 notify 里的抑制判断拿不到值，
 		// 用户点过的「忽略本版本」会在下一轮扫描后失效。
 		img.IgnoredDigest = existing.IgnoredDigest
+		// 同理带上「提醒过哪一版」。这两个值一旦丢了，用户清掉通知历史后
+		// 同一版本就会重新冒出来 —— 而且看起来像在抽风，因为卡片明明点过了。
+		img.NotifiedTag = existing.NotifiedTag
+		img.NotifiedDigest = existing.NotifiedDigest
 		img.Aliases = existing.Aliases
 		img.LatestTag = existing.LatestTag
 	}
@@ -563,18 +591,29 @@ func (s *Scanner) notify(ctx context.Context, img *model.Image, kind model.Notif
 		if _, err := s.st.FindPendingNotification(img.Reference, img.ContainerID); err == nil {
 			return false
 		}
+		// 这一版已经提醒过，或者用户点过「忽略本版本」。
+		//
+		// 判断依据记在**监控项**上，不是通知记录里：用户清掉已读历史之后那条
+		// 记录就没了，还照它判断等于「删一条通知就让同一版本重新冒出来」——
+		// 这正是「忽略或移除的提醒总是又出现」的根因。
+		//
+		// HasNotificationForTag 留着兜底，覆盖升级前的老数据：那时还没有
+		// notified_tag，历史记录是唯一的依据。
 		if kind == model.NotifNewTag && img.LatestTag != "" {
+			if img.NotifiedTag != "" && version.SameVersion(img.NotifiedTag, img.LatestTag) {
+				return false
+			}
 			if ok, err := s.st.HasNotificationForTag(img.Reference, img.ContainerID, img.LatestTag); err == nil && ok {
 				return false
 			}
 		}
-		// 用户在飞书卡片上点过「忽略本版本」：只要远端内容没再变，就别反复提醒。
+		// 用户在卡片上点过「忽略本版本」：只要远端内容没再变，就别反复提醒。
 		//
 		// 这里必须比**远端摘要**而不是 tag：浮动 tag 场景下 tag 永远不变，
 		// 能区分「还是那一版」和「作者又推了新一版」的只有摘要。
-		// new_tag 不需要这一步 —— HasNotificationForTag 已经把「同一个更高版本」
-		// 跨轮次去重了。
-		if kind == model.NotifNewVersion && img.IgnoredDigest != "" && img.IgnoredDigest == img.RemoteDigest {
+		// new_tag 不需要这一步 —— 上面按 tag 比过了。
+		if kind == model.NotifNewVersion && img.RemoteDigest != "" &&
+			(img.NotifiedDigest == img.RemoteDigest || img.IgnoredDigest == img.RemoteDigest) {
 			return false
 		}
 	}
@@ -599,6 +638,17 @@ func (s *Scanner) notify(ctx context.Context, img *model.Image, kind model.Notif
 		return false
 	}
 	n.ID = id
+
+	// 记下「这一版说过了」，位置必须在推送之前 —— 没配渠道时下面会直接返回，
+	// 而页面上那条提醒已经存在，下一轮不该再补一条。
+	//
+	// 两个标记分开写：new_tag 场景的 RemoteDigest 是**旧 tag** 的摘要，
+	// 拿它当「已提醒的摘要」会在下一轮把新版本当成「提醒过了」而漏掉。
+	if kind == model.NotifNewTag {
+		_ = s.st.SetImageNotified(img.ID, img.LatestTag, "")
+	} else if img.RemoteDigest != "" {
+		_ = s.st.SetImageNotified(img.ID, "", img.RemoteDigest)
+	}
 
 	s.mu.Lock()
 	notifier := s.notifier
