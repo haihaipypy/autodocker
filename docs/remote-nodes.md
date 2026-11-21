@@ -116,7 +116,7 @@ curl -fsSL https://hub.1day.vip/api/agent/install.sh | sh -s -- --token=<32位�
 
 脚本**不拉镜像**，而是从 Hub 取程序本体（`GET /api/agent/binary`，用节点令牌鉴权），挂进一个 alpine 容器里跑。这么做有两个直接好处：
 
-- **版本永远一致**：Agent 跑的就是 Hub 这一份字节，Hub 是 1.7.4，装上去就是 1.7.4。不会出现「`latest` 指向旧版本、装完不工作」。
+- **版本永远一致**：Agent 跑的就是 Hub 这一份字节，Hub 是 1.7.5，装上去就是 1.7.5。不会出现「`latest` 指向旧版本、装完不工作」。
 - **目标机不必访问 Docker Hub**：国内 NAS 拉镜像常要代理或加速器，这条路直接绕开；只需要能拉到 `alpine:3.24`（约 3 MB）。
 
 架构限制：镜像里没有别的架构的产物，Hub 只能下发**与自己同架构**的那一份。x86 的 Hub 管 ARM 的 NAS 时，命令末尾加 `--image` 退回镜像方式：
@@ -176,7 +176,7 @@ docker run -d --name autodocker-agent --restart=unless-stopped \
   -e AUTODOCKER_HUB=https://hub.1day.vip \
   -e AUTODOCKER_TOKEN=<令牌> \
   -e AUTODOCKER_NODE_NAME="$(hostname)" \
-  haihaipypy/autodocker:1.7.4
+  haihaipypy/autodocker:1.7.5
 ```
 
 系统信息（发行版、内核）从 `docker info` 里读，不用额外挂 `/etc/os-release`。
