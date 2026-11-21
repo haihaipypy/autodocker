@@ -266,7 +266,10 @@ func (s *Server) agentImage() string {
 	}
 	// 跟上 Hub 自己的版本，而不是笼统的 latest：latest 指向什么永远是未知数，
 	// 「装了却跑成旧版」正是这种不确定性造成的。
-	tag := strings.TrimSpace(selfcheck.Version)
+	//
+	// 去掉前缀 v：CI 按 git tag 传进来的是 v1.7.5，而 Docker Hub 上的镜像标签
+	// 是 1.7.5。少这一下，跨架构回退时会去拉一个不存在的标签。
+	tag := strings.TrimPrefix(strings.TrimSpace(selfcheck.Version), "v")
 	if tag == "" || tag == "dev" {
 		tag = "latest"
 	}

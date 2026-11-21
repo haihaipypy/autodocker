@@ -12,11 +12,12 @@ RUN go mod download
 
 COPY . .
 
-# 版本号由 CI 按 tag 传进来，编进二进制里给「自检更新」用。
+# 版本号由 CI 按 tag 传进来（形如 v1.7.5），去掉前缀 v 再编进二进制：
+# 程序里会拿它拼跨架构回退用的镜像标签，而镜像标签是 1.7.5。
 # 分支构建传 dev —— 拿 sha 当版本号会被当成「1.4.1 这种数字版本」去比大小，结论全是错的。
 ARG VERSION=dev
-RUN go build -trimpath \
-    -ldflags="-s -w -X github.com/haihaipypy/autodocker/internal/selfcheck.Version=${VERSION}" \
+RUN V="${VERSION#v}" && go build -trimpath \
+    -ldflags="-s -w -X github.com/haihaipypy/autodocker/internal/selfcheck.Version=${V}" \
     -o /out/autodocker ./cmd/server
 
 # ---- 运行阶段 ----
