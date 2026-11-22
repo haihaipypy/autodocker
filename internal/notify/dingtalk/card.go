@@ -30,10 +30,16 @@ func BuildUpdateParams(n *model.Notification) CardParams {
 		name = "（无关联容器）"
 	}
 
-	lines := []string{
+	var lines []string
+	// 钉钉的卡片正文是 markdown，不认 <font> 之类的写法，只能靠符号 + 加粗
+	// 把节点和本机提醒区分开（本机提醒没有这一行）。
+	if n.NodeName != "" {
+		lines = append(lines, "**🖥️ 节点："+n.NodeName+"**")
+	}
+	lines = append(lines,
 		fmt.Sprintf("**容器**：%s", name),
 		fmt.Sprintf("**镜像**：%s", n.ImageRef),
-	}
+	)
 	if n.Kind == model.NotifNewTag && n.LatestTag != "" {
 		lines = append(lines,
 			fmt.Sprintf("**当前版本**：%s", orDash(n.LocalTag)),
@@ -83,6 +89,9 @@ func BuildStateParams(n *model.Notification, state model.CardState, detail strin
 		name = n.ImageRef
 	}
 	body := fmt.Sprintf("**容器**：%s\n\n%s", name, orDash(detail))
+	if n.NodeName != "" {
+		body = "**🖥️ 节点：" + n.NodeName + "**\n\n" + body
+	}
 	return CardParams{
 		VarTitle:  title,
 		VarStatus: status,

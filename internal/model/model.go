@@ -89,6 +89,22 @@ type Image struct {
 	LastError      string    `json:"last_error"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
+
+	// ComposeProject 这个容器所属的 compose 项目（来自容器标签），没有则为空。
+	// 巡检时按它把「同一轮里同一项目的多个更新」合并成一条通知。
+	ComposeProject string `json:"compose_project"`
+
+	// ComposeService 这个容器在 compose 文件里的服务名。
+	//
+	// 容器名和服务名不一定相同（容器名还带项目前缀与序号），而 depends_on
+	// 里写的是服务名 —— 想按依赖排序就必须有它，拿容器名去套会套不上。
+	ComposeService string `json:"compose_service,omitempty"`
+
+	// ComposeDeps 这个服务 depends_on 的服务名列表。
+	//
+	// 只在重建前用来排序：上游先换、下游后换，免得下游起来时上游正在重启。
+	// 老 Agent 不上报这两个字段，取到空就按原顺序走，行为和以前完全一致。
+	ComposeDeps []string `json:"compose_deps,omitempty"`
 }
 
 // LocalImage 是「镜像」标签页上的一行：本机真实存在的镜像，
@@ -159,10 +175,25 @@ const (
 
 // Notification 一条更新提醒。
 type Notification struct {
-	ID            int64            `json:"id"`
-	ImageRef      string           `json:"image_ref"`
-	ContainerID   string           `json:"container_id"`
-	ContainerName string           `json:"container_name"`
+	ID            int64  `json:"id"`
+	ImageRef      string `json:"image_ref"`
+	ContainerID   string `json:"container_id"`
+	ContainerName string `json:"container_name"`
+
+	// NodeID 这条提醒来自哪台远程节点，0 表示本机。
+	//
+	// 本机的更新走 updater 直接重建；带 node_id 的要点「更新」就得先下发指令到
+	// 那台机器，两条路完全不同，所以来源必须记在通知上 —— 按钮回调只带通知 ID，
+	// 没有第二个地方能反查出来源。
+	NodeID   int64  `json:"node_id"`
+	NodeName string `json:"node_name"`
+
+	// VersionKey 去重用的版本标识：有更高 tag 时是那个 tag，否则是远端摘要。
+	//
+	// 远端节点的快照每轮整体替换，没有地方像 images.notified_tag 那样
+	// 长久记住「这一版说过了」，只能靠通知记录本身去重。
+	VersionKey string `json:"-"`
+
 	Kind          NotificationKind `json:"kind"`
 	Title         string           `json:"title"`
 	Body          string           `json:"body"`
@@ -173,6 +204,23 @@ type Notification struct {
 	Aliases       []string         `json:"aliases"`
 	Read          bool             `json:"read"`
 	CardState     CardState        `json:"card_state"`
+
+	// CardDetail 卡片上那句结果说明，跟状态一起落库。
+	//
+	// 以前失败原因只活在 IM 卡片的那一版外观里：网页上只有一个「失败」徽章，
+	// 到底是拉取镜像被墙、镜像名写错，还是容器起不来，用户完全看不出来，
+	// 重启之后连卡片也变回一句「更新失败」。存下来，两边才有同一份依据。
+	CardDetail string `json:"card_detail"`
+
+	// ComposeProject 这条提醒合并的 compose 项目，空表示没合并（单容器提醒）。
+	//
+	// 同一项目里的服务通常一起发版：6 个服务是 6 条消息、点 6 次，手机上
+	// 一次弹一屏。合并之后一条提醒覆盖整个项目，一个按钮依次更新全部。
+	ComposeProject string `json:"compose_project"`
+	// MemberCount 这条提醒覆盖几个容器。1（或 0，老数据）表示普通单容器提醒。
+	MemberCount int `json:"member_count"`
+	// Members 逐容器的更新项与结果，从 notification_members 载入。
+	Members []NotificationMember `json:"members,omitempty"`
 
 	// 这条通知推送到了哪个渠道、投递到哪个会话、对方的消息 ID。
 	// 三者必须一起记：更新完成后要「原地改掉那条消息」，
@@ -200,6 +248,65 @@ type Delivery struct {
 	MessageID string  `json:"message_id"`
 }
 
+// NotificationMember 一条合并提醒里的一个容器。
+//
+// 版本与结果都按容器分开记：同一个项目里 6 个服务可能各差一版，
+// 更新也是一次只动一个 —— 谁成功了、谁失败了必须落到各自的格子里，
+// 否则「6 个里成 3 个」这种情况只能给一句含糊的「部分成功」。
+type NotificationMember struct {
+	ContainerID   string `json:"container_id"`
+	ContainerName string `json:"container_name"`
+	ImageRef      string `json:"image_ref"`
+	// VersionKey 这一版的服务端去重键（tag:xxx / digest:xxx），
+	// 远端节点没有 images 表，只能靠它记住「这一版提醒过了」。
+	VersionKey string `json:"-"`
+	// Kind 这一项是「同 tag 内容变了」还是「出现了更高的版本 tag」。
+	Kind          NotificationKind `json:"kind"`
+	LocalTag      string           `json:"local_tag"`
+	LatestTag     string           `json:"latest_tag"`
+	LocalSummary  string           `json:"local_summary"`
+	RemoteSummary string           `json:"remote_summary"`
+	// State pending / updating / done / failed
+	State string `json:"state"`
+	Error string `json:"error,omitempty"`
+}
+
+// AllMembers 这条提醒覆盖的容器列表。
+//
+// 老记录（合并功能之前建的）没有成员行，按主字段补一条出来 —— 调用方
+// 不必到处判断「这条是老的还是新的」，更新流程对两者是同一条路径。
+func (n *Notification) AllMembers() []NotificationMember {
+	if len(n.Members) > 0 {
+		return n.Members
+	}
+	if n.ContainerID == "" && n.ContainerName == "" && n.ImageRef == "" {
+		return nil
+	}
+	return []NotificationMember{{
+		ContainerID:   n.ContainerID,
+		ContainerName: n.ContainerName,
+		ImageRef:      n.ImageRef,
+		VersionKey:    n.VersionKey,
+		Kind:          n.Kind,
+		LocalTag:      n.LocalTag,
+		LatestTag:     n.LatestTag,
+		LocalSummary:  n.LocalSummary,
+		RemoteSummary: n.RemoteSummary,
+		State:         string(n.CardState),
+	}}
+}
+
+// IsGroup 这条提醒是不是合并了多个容器。
+//
+// 以成员行数兜底而不是只看 MemberCount：老库与新库混着用的时候，
+// 那个计数列可能是 0，而成员行是实打实的。
+func (n *Notification) IsGroup() bool {
+	if len(n.Members) > 1 {
+		return true
+	}
+	return n.MemberCount > 1
+}
+
 // TaskStatus 更新任务状态。
 type TaskStatus string
 
@@ -213,11 +320,20 @@ const (
 
 // Task 一次容器更新任务。
 type Task struct {
-	ID             int64      `json:"id"`
-	NotificationID int64      `json:"notification_id"`
-	ImageRef       string     `json:"image_ref"`
-	ContainerID    string     `json:"container_id"`
-	ContainerName  string     `json:"container_name"`
+	ID             int64  `json:"id"`
+	NotificationID int64  `json:"notification_id"`
+	ImageRef       string `json:"image_ref"`
+	ContainerID    string `json:"container_id"`
+	ContainerName  string `json:"container_name"`
+
+	// NodeID 任务跑在哪台机器上，0 表示本机。
+	//
+	// 远端任务的 id 由 Hub 分配 —— Agent 自己也建了任务，但那份记录在它本地库里，
+	// Hub 读不到。历史列表要让用户看清「这次重建发生在哪台机器」，
+	// 就只能由 Hub 自己再记一份。
+	NodeID   int64  `json:"node_id"`
+	NodeName string `json:"node_name"`
+
 	NewContainerID string     `json:"new_container_id"`
 	Status         TaskStatus `json:"status"`
 	TriggeredBy    string     `json:"triggered_by"` // feishu / web / auto
@@ -303,6 +419,26 @@ type NodeContainer struct {
 	Ignored       bool        `json:"ignored"`
 	LastError     string      `json:"last_error"`
 	CheckedAt     time.Time   `json:"checked_at"`
+
+	// ComposeProject 容器所属的 compose 项目，来自容器标签
+	// com.docker.compose.project；docker run 建的容器为空。
+	//
+	// 一个项目里的服务通常一起发版，通知要按项目合并 —— 否则一次发 6 个服务
+	// 就是 6 条消息、点 6 次。标签是唯一可靠依据，不能拿容器名前缀去猜。
+	// 老 Agent 不上报这个字段，Hub 侧按空处理，退化成一条一条提醒。
+	ComposeProject string `json:"compose_project,omitempty"`
+
+	// ComposeService 该容器在 compose 文件里的服务名。
+	//
+	// 重建前按 depends_on 排顺序要用它：depends_on 里写的是服务名，
+	// 而 container_name 还带着项目前缀和序号，两者不能互换着用。
+	ComposeService string `json:"compose_service,omitempty"`
+
+	// ComposeDeps 这个服务 depends_on 的服务名列表，同样是容器标签带回来的。
+	//
+	// 只是顺序依据：上游先重建、下游后重建。缺字段时（老 Agent）排不出依赖，
+	// 那就保持快照原顺序 —— 不猜比乱猜安全。
+	ComposeDeps []string `json:"compose_deps,omitempty"`
 }
 
 // NodeContainerView 列表页要的一行：快照 + 节点名。
@@ -380,6 +516,13 @@ type Settings struct {
 	// 默认敞开的话，端口一暴露出去就是个任人使用的消息推送机。
 	// 它独立于访问密码：调用方是别的程序，不该被逼着保管管理员口令。
 	PushToken string `json:"push_token"`
+
+	// AgentAutoUpgrade 节点上的 Agent 是否自动跟随 Hub 升级。
+	//
+	// 用指针是为了区分「没设置过」与「显式关闭」：老库升级上来没有这个字段，
+	// 缺失时按开启处理 —— 用户装远程节点图的就是不用一台台登录，
+	// 每次 Hub 升级都要重跑安装命令正好把这份便利抵消掉。
+	AgentAutoUpgrade *bool `json:"agent_auto_upgrade"`
 
 	// CheckUpdates 每天去 GitHub 看一眼自己有没有新版本，只提示、不自动安装。
 	// 关掉就彻底不出网 —— 有些机器在内网，不想有任何多余的外连。

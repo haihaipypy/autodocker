@@ -884,3 +884,20 @@ func (c *Checker) dueForCheck(every time.Duration) bool {
 	defer c.mu.Unlock()
 	return c.lastRun.IsZero() || c.now().Sub(c.lastRun) >= every
 }
+
+// AgentImage 节点以镜像方式安装时，该去拉的镜像引用。
+//
+// 跟 Hub 自己的版本走而不是笼统的 latest：latest 指向什么永远是未知数，
+// 「装了却跑成旧版」正是这种不确定性造成的。
+//
+// 去掉前缀 v：CI 按 git tag 传进来的是 v1.8.4，Docker Hub 上的标签是 1.8.4。
+func AgentImage(override string) string {
+	if v := strings.TrimSpace(override); v != "" {
+		return v
+	}
+	tag := strings.TrimPrefix(strings.TrimSpace(Version), "v")
+	if tag == "" || tag == "dev" {
+		tag = "latest"
+	}
+	return "haihaipypy/autodocker:" + tag
+}

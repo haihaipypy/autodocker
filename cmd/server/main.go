@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/haihaipypy/autodocker/internal/config"
 	"github.com/haihaipypy/autodocker/internal/dockerx"
 	"github.com/haihaipypy/autodocker/internal/hub"
+	"github.com/haihaipypy/autodocker/internal/hubproto"
 	"github.com/haihaipypy/autodocker/internal/hubserver"
 	"github.com/haihaipypy/autodocker/internal/model"
 	"github.com/haihaipypy/autodocker/internal/notify"
@@ -25,11 +27,21 @@ import (
 	"github.com/haihaipypy/autodocker/internal/registry"
 	"github.com/haihaipypy/autodocker/internal/scanner"
 	"github.com/haihaipypy/autodocker/internal/selfcheck"
+	"github.com/haihaipypy/autodocker/internal/selfupgrade"
 	"github.com/haihaipypy/autodocker/internal/store"
 	"github.com/haihaipypy/autodocker/internal/updater"
 )
 
 func main() {
+	// 升级 helper 必须在加载配置之前分流：它跑在一个临时容器里，没有环境变量、
+	// 没有数据卷以外的东西，唯一要做的就是把旧容器换成新版或者原样退回去。
+	if len(os.Args) > 1 && os.Args[1] == selfupgrade.HelperCommand {
+		if err := selfupgrade.RunHelper(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "升级失败:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "启动失败:", err)
 		os.Exit(1)
@@ -133,10 +145,29 @@ func run() error {
 	sc.SetNotifier(nt)
 
 	// 远程节点接入点。Hub 只收上报、下发指令，判定逻辑在 Agent 那边。
+	//
+	// 两个回调把三块能力串起来：
+	//   - Notifier：远端发现更新时由 Hub 统一发提醒（渠道凭据只在 Hub 上）；
+	//   - OnOp：Agent 报回的进度用来把卡片从「更新中」翻成结果。
+	//
+	// 自动升级要读设置页里的开关，而设置属于 api.Server —— 它是后面才建的。
+	// 用一个原子指针把「后建的 srv」接进来，比在这里复制一份设置初值可靠：
+	// 用户在页面上关掉开关后，下一次节点连上来立刻就能读到新值。
+	var settingsOwner atomic.Pointer[api.Server]
+
 	hubsrv := hubserver.New(hubserver.Config{
 		Version:      selfcheck.Version,
 		ScanInterval: int(cfg.ScanInterval / time.Second),
+		Notifier:     nt,
+		OnOp:         nt.NodeOpEvent,
+		AgentImage:   selfcheck.AgentImage(cfg.AgentImage),
+		AutoUpgrade: func() bool {
+			srv := settingsOwner.Load()
+			return srv != nil && srv.AgentAutoUpgrade()
+		},
 	}, st, logger)
+	// 反过来把节点通道交给通知服务：卡片上点「更新」时才知道往哪台机器发指令。
+	nt.SetRemoteNodes(hubsrv)
 
 	srv := api.New(api.Deps{
 		Cfg:      cfg,
@@ -150,6 +181,7 @@ func run() error {
 		Hub:      hubsrv,
 		Logger:   logger,
 	})
+	settingsOwner.Store(srv)
 	// 以持久化设置为准（环境变量只作首次启动的初值）。
 	// 飞书凭据也走这里下发，所以长连接在应用了设置之后就已经就绪 ——
 	// 用户装完在网页里补填凭据时，保存动作会再次调用同一入口把它拉起来，
@@ -291,17 +323,56 @@ func runAgent(ctx context.Context, cfg *config.Config, logger *slog.Logger,
 		// Agent 只上报容器：镜像维度在这台机器上没有任何展示入口，
 		// 而它的检测是串行的，访问不了 Docker Hub 的机器上能耗掉几十分钟。
 		SkipImages: true,
+		// 自升级用的 helper 与「改名待删」的旧容器不是用户的容器，
+		// 出现在 Hub 的节点列表里只会让人困惑（还带着「可选更新」）。
+		ExcludeContainers: selfupgrade.AuxContainers(cfg.SelfContainer),
 	}, logger)
 	// 刻意不注入 notifier：Agent 只上报，通知统一由 Hub 发。
 	// scanner.notify() 在 notifier 为 nil 时只落库不推送，正好是这个语义。
+	//
+	// 但 updater 要建：1.8.0 起 Hub 可以下发「重建这个容器」，
+	// 判定（要不要更新、更新到哪个 tag）仍留在 Agent 这边，Hub 只说重建谁。
+	up := updater.New(dk, st, updater.Options{
+		PullTimeout:       cfg.PullTimeout,
+		StopTimeoutSec:    30,
+		HealthCheckWait:   cfg.HealthCheckWait,
+		RollbackOnFailure: cfg.RollbackOnFailure,
+		KeepOldContainer:  cfg.KeepOldContainer,
+		SelfContainer:     cfg.SelfContainer,
+		SelfContainerID:   cfg.SelfContainerID,
+	}, logger)
+
+	// 上一轮自动升级如果发生过，结局记在数据卷里。这里读一次就删，
+	// 随首份上报带给 Hub —— 用户能在节点页的日志里看到成败与原因。
+	selfupgrade.Cleanup(actx, dk, logger)
+	upgradeRes := selfupgrade.ConsumeResult()
+	if upgradeRes != nil {
+		if upgradeRes.OK {
+			logger.Info("上次自动升级成功", "from", upgradeRes.From, "to", upgradeRes.Target)
+		} else {
+			logger.Warn("上次自动升级失败并已回滚", "from", upgradeRes.From,
+				"to", upgradeRes.Target, "err", upgradeRes.Error)
+		}
+	}
 
 	hc := hub.New(hub.Config{
-		HubURL:       cfg.HubURL,
-		Token:        cfg.NodeToken,
-		NodeName:     cfg.NodeName,
-		Version:      selfcheck.Version,
-		ScanInterval: cfg.ScanInterval,
-	}, sc, st, dk, logger, ring)
+		HubURL:          cfg.HubURL,
+		Token:           cfg.NodeToken,
+		NodeName:        cfg.NodeName,
+		Version:         selfcheck.Version,
+		ScanInterval:    cfg.ScanInterval,
+		SelfContainer:   cfg.SelfContainer,
+		SelfContainerID: cfg.SelfContainerID,
+	}, sc, st, dk, up, logger, ring)
+	if upgradeRes != nil {
+		hc.SetUpgradeResult(&hubproto.UpgradeResult{
+			OK:     upgradeRes.OK,
+			From:   upgradeRes.From,
+			Target: upgradeRes.Target,
+			Error:  upgradeRes.Error,
+			At:     upgradeRes.FinishedAt,
+		})
+	}
 
 	logger.Info("AutoDocker Agent 已启动",
 		"version", selfcheck.Version,

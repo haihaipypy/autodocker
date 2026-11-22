@@ -1,9 +1,14 @@
 package updater
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/haihaipypy/autodocker/internal/dockerx"
 	"github.com/haihaipypy/autodocker/internal/model"
@@ -277,5 +282,148 @@ func TestSameImageID(t *testing.T) {
 		if got := sameImageID(c.a, c.b); got != c.want {
 			t.Errorf("sameImageID(%q,%q) = %v，期望 %v", c.a, c.b, got, c.want)
 		}
+	}
+}
+
+// 健康检查窗口必须按容器自己的 HEALTHCHECK 配置算。
+//
+// 这条钉的是 safeline-detector 的翻车现场：镜像里 interval=15s、retries=5、
+// start_period=3s，而默认窗口只有 20 秒 —— 第一次探测失败后要等 15 秒才有
+// 第二次，窗口早就到期了，每次都停在 starting 被当成失败回滚。
+// 窗口至少要覆盖「启动宽限 + 全部重试 + 一次探测超时」。
+func TestHealthWindowFollowsHealthcheck(t *testing.T) {
+	insp := &dockerx.Inspect{Config: map[string]any{
+		"Healthcheck": map[string]any{
+			"Test":        []any{"CMD", "/detector/health-check", "-c", "/detector/detector.yml"},
+			"Interval":    float64(15 * time.Second),
+			"Timeout":     float64(3 * time.Second),
+			"StartPeriod": float64(3 * time.Second),
+			"Retries":     float64(5),
+		},
+	}}
+	// start_period 3 + interval 15×5 + timeout 3 + 10 秒缓冲
+	if got, want := healthWindow(insp), 91*time.Second; got != want {
+		t.Fatalf("窗口算错：%v，期望 %v", got, want)
+	}
+}
+
+// 没有健康检查的容器不该被硬凑出一个窗口：
+// 它们靠「运行一段时间没退出」判定，窗口取用户设置值即可。
+func TestHealthWindowWithoutHealthcheck(t *testing.T) {
+	cases := map[string]*dockerx.Inspect{
+		"没有 Healthcheck 字段": {Config: map[string]any{"Image": "nginx:latest"}},
+		"Test 为 NONE": {Config: map[string]any{
+			"Healthcheck": map[string]any{"Test": []any{"NONE"}},
+		}},
+		"Test 为空数组": {Config: map[string]any{
+			"Healthcheck": map[string]any{"Test": []any{}},
+		}},
+	}
+	for name, insp := range cases {
+		if got := healthWindow(insp); got != 0 {
+			t.Errorf("%s：应该返回 0（交给用户设置的窗口），实际 %v", name, got)
+		}
+	}
+}
+
+// 极端配置要有上限，否则整批更新会被一个容器永久拖住。
+func TestHealthWindowCapped(t *testing.T) {
+	insp := &dockerx.Inspect{Config: map[string]any{
+		"Healthcheck": map[string]any{
+			"Test":     []any{"CMD", "true"},
+			"Interval": float64(time.Minute),
+			"Retries":  float64(30),
+		},
+	}}
+	if got := healthWindow(insp); got != maxHealthWindow {
+		t.Fatalf("应该截到 %v，实际 %v", maxHealthWindow, got)
+	}
+}
+
+func TestHumanDuration(t *testing.T) {
+	cases := map[time.Duration]string{
+		45 * time.Second:              "45 秒",
+		91 * time.Second:              "1 分 31 秒",
+		time.Minute:                   "1 分钟",
+		2*time.Minute + 5*time.Second: "2 分 5 秒",
+	}
+	for d, want := range cases {
+		if got := humanDuration(d); got != want {
+			t.Errorf("%v 应显示为 %q，实际 %q", d, want, got)
+		}
+	}
+}
+
+// newFakeDocker 起一个只回 inspect 的假 Docker API。
+// State() 内部走的就是 /containers/{id}/json，所以这一份响应同时覆盖两条路径。
+func newFakeDocker(t *testing.T, state func() (bool, string)) *dockerx.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		running, health := state()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"Id":         "abc",
+			"Name":       "/safeline-detector",
+			"Config":     map[string]any{"Image": "chaitin/safeline-detector:9.4.3"},
+			"HostConfig": map[string]any{},
+			"State": map[string]any{
+				"Running": running,
+				"Status":  "running",
+				"Health":  map[string]any{"Status": health},
+			},
+		})
+	}))
+	t.Cleanup(srv.Close)
+	dk, err := dockerx.New(srv.URL)
+	if err != nil {
+		t.Fatalf("构造客户端失败: %v", err)
+	}
+	return dk
+}
+
+// 窗口到期时仍是 starting：容器明明在跑，不能判失败。
+//
+// 对应 1.10.3 的现场：safeline-detector 第一次探测失败后要等下一个 interval，
+// 窗口到期时状态还是 starting，旧逻辑直接回滚，用户看到「更新失败」而服务一直是好的。
+func TestWaitHealthyStartingIsNotFailure(t *testing.T) {
+	u := &Updater{dk: newFakeDocker(t, func() (bool, string) { return true, "starting" })}
+
+	ok, msg, confirmed := u.waitHealthy(context.Background(), "abc", time.Second, func(string, ...any) {})
+	if !ok {
+		t.Fatalf("容器在跑、只是还没验完，不该判失败：%s", msg)
+	}
+	if confirmed {
+		t.Error("starting 到期应标记为「未确认」")
+	}
+	if !strings.Contains(msg, "starting") {
+		t.Errorf("原因里要写清仍是 starting，实际 %q", msg)
+	}
+}
+
+// 探测结果出来 healthy 就正常通过，不用等满窗口。
+func TestWaitHealthyBecomesHealthy(t *testing.T) {
+	var calls int32
+	u := &Updater{dk: newFakeDocker(t, func() (bool, string) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return true, "starting"
+		}
+		return true, "healthy"
+	})}
+
+	ok, msg, confirmed := u.waitHealthy(context.Background(), "abc", 20*time.Second, func(string, ...any) {})
+	if !ok || !confirmed {
+		t.Fatalf("healthy 应该算确认通过，实际 ok=%v confirmed=%v msg=%q", ok, confirmed, msg)
+	}
+}
+
+// unhealthy 是真的连续探测失败，必须回滚。
+func TestWaitHealthyUnhealthyFails(t *testing.T) {
+	u := &Updater{dk: newFakeDocker(t, func() (bool, string) { return true, "unhealthy" })}
+
+	ok, msg, _ := u.waitHealthy(context.Background(), "abc", 20*time.Second, func(string, ...any) {})
+	if ok {
+		t.Fatalf("unhealthy 必须判失败，实际通过：%s", msg)
+	}
+	if !strings.Contains(msg, "unhealthy") {
+		t.Errorf("原因里要写清 unhealthy，实际 %q", msg)
 	}
 }

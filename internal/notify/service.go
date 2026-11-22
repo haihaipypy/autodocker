@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/haihaipypy/autodocker/internal/hubproto"
 	"github.com/haihaipypy/autodocker/internal/model"
 	"github.com/haihaipypy/autodocker/internal/notify/dingtalk"
 	"github.com/haihaipypy/autodocker/internal/notify/feishu"
@@ -139,6 +140,17 @@ type Service struct {
 	cbAction string
 	cbChan   model.Channel
 	cbCount  int
+
+	// 远端节点更新能力（hubserver）。为 nil 时带节点的提醒只能看不能点。
+	remoteMu sync.RWMutex
+	remote   RemoteNodes
+
+	// 合并提醒的「一键全更新」同一时刻只允许一个在跑。
+	//
+	// 底层更新器本来就是单飞的（本机一把锁、远端一台机器一个任务），
+	// 同时起两批只会在第一个成员就撞「已有更新任务正在执行」，
+	// 用户看到的是「点了没反应还报错」。串起来，第二批等第一批跑完再开始。
+	batchMu sync.Mutex
 }
 
 // New 构造通知服务。baseCtx 用于派生异步更新任务的上下文。
@@ -198,6 +210,40 @@ func (s *Service) ApplyNotifyEnabled(feishu, telegramCh, dingtalkCh, wecomCh boo
 	s.enabled[model.ChannelDingTalk] = dingtalkCh
 	s.enabled[model.ChannelWeCom] = wecomCh
 	s.enMu.Unlock()
+}
+
+// RemoteNodes 远端节点的更新能力，由 hubserver 实现。
+//
+// 用接口而不是直接依赖 hubserver：通知服务不该知道 WebSocket、令牌、快照
+// 这些东西，它只需要「这台机器能不能动」和「让它动起来」两件事。
+type RemoteNodes interface {
+	Online(nodeID int64) bool
+	// UpdateContainer 让那台机器重建一个容器，返回受理说明与实际下发的容器快照。
+	//
+	// 快照要带回来：容器被重建过时提醒里的编号已经过期，服务端按名字找回了
+	// 新编号，这边得把它写回通知，否则节点回传结果时对不上那一条卡片。
+	UpdateContainer(nodeID int64, containerID, containerName string) (string, *model.NodeContainer, error)
+	// PullContainer 只让节点把镜像拉下来，不重建容器。
+	//
+	// 批量更新的第一步：整批镜像先拉齐，再动容器。旧 Agent 会回
+	// 「不支持的指令」，调用方识别后退化成逐个更新，不算失败。
+	PullContainer(nodeID int64, containerID, containerName string) error
+	// OpResult 最近一次操作到了哪一步、耗时多久。批量更新用它判断一个成员
+	// 是否已经跑完，以及是成功还是失败。
+	OpResult(nodeID int64) (phase, message string, updatedAt time.Time)
+	// Busy 那台机器此刻是不是真有一个更新在跑。
+	//
+	// 用来分辨「卡片停在更新中」到底是真在跑，还是任务早已结束、只是状态没写回来
+	// （进程重启、事件帧丢了，或者旧版本留下的僵尸状态）。分不清的话，
+	// 那种卡片再点一次只会永远回「进行中」，用户没有任何办法收尾。
+	Busy(nodeID int64) bool
+}
+
+// SetRemoteNodes 注入远端更新能力。不注入时，带 node_id 的提醒只能看不能点。
+func (s *Service) SetRemoteNodes(r RemoteNodes) {
+	s.remoteMu.Lock()
+	s.remote = r
+	s.remoteMu.Unlock()
 }
 
 // channelEnabled 渠道开关是否打开。没下发过一律按关闭处理：
@@ -1137,7 +1183,12 @@ func (s *Service) applyAction(n *model.Notification, action string, from model.C
 		// 光把这条通知标成「已忽略」是拦不住下一条消息的：扫描只看远端内容变没变，
 		// 下一轮照样判成「有更新」并新建一条通知。必须把「用户已放行这一版」
 		// 记到监控项上，消息里那句「同一个版本不会再次提醒」才是真的。
-		s.rememberIgnored(n)
+		//
+		// 远端没有对应的监控项：它的去重靠通知记录本身（见 HasNodeNotificationKey），
+		// 这条记录就在库里，天然不会再推第二遍。
+		if n.NodeID == 0 {
+			s.rememberIgnored(n)
+		}
 		return actionOutcome{
 			Toast:  "已忽略该版本",
 			State:  model.CardIgnored,
@@ -1151,7 +1202,14 @@ func (s *Service) applyAction(n *model.Notification, action string, from model.C
 		// 「稍后提醒」靠清掉「已提醒过」标记实现：不清的话下一轮扫描会认为
 		// 这一版早说过了，那张卡片就成了最后一次提醒，卡片上写的
 		// 「下次巡检会重新推送」变成空话。
-		if img := s.findImageForNotification(n); img != nil {
+		for _, m := range n.AllMembers() {
+			img, err := s.st.FindImageByContainer(m.ContainerID)
+			if err != nil || img == nil {
+				img = s.findImageForNotification(&model.Notification{ImageRef: m.ImageRef, ContainerID: m.ContainerID})
+			}
+			if img == nil {
+				continue
+			}
 			if err := s.st.ClearImageNotified(img.ID); err != nil {
 				s.log.Warn("清除已提醒标记失败", "err", err)
 			}
@@ -1164,17 +1222,46 @@ func (s *Service) applyAction(n *model.Notification, action string, from model.C
 
 	case ActionUpdate:
 		if n.CardState == model.CardUpdating {
-			// 重复点击：不再起第二个任务，但要把卡片刷成当前状态。
-			// 早先这里返回的 State 是空的，于是一连点两下就是「两下都没反应」，
-			// 用户会以为第一次也没生效。
-			return actionOutcome{
-				Toast:  "更新已在进行中",
-				State:  model.CardUpdating,
-				Detail: "这条更新的任务已经在跑了，完成后这里会自动变成结果，不用重复点。",
+			// 卡片写着「更新中」，但那边其实没有任务在跑 —— 这中间断过：
+			// Hub 重启、事件帧丢了，或者更早的版本压根没把状态写进库里。
+			// 这种卡片最难受的地方是「再点一次」也永远只会回「进行中」，
+			// 用户没有任何办法把它收尾，只能等下一条新提醒把它盖过去。
+			//
+			// 所以先问一句「真的还在跑吗」，不在跑就当成一次新的更新重新下发；
+			// 容器若已经在目标镜像上，updater 会直接判定成功、不走重建。
+			if s.updateStillRunning(n) {
+				// 重复点击：不再起第二个任务，但要把卡片刷成当前状态。
+				// 早先这里返回的 State 是空的，于是一连点两下就是「两下都没反应」，
+				// 用户会以为第一次也没生效。
+				return actionOutcome{
+					Toast:  "更新已在进行中",
+					State:  model.CardUpdating,
+					Detail: "这条更新的任务已经在跑了，完成后这里会自动变成结果，不用重复点。",
+				}
 			}
+			s.log.Info("卡片停在更新中但任务已不在运行，按陈旧状态重新执行",
+				"notif", n.ID, "node", n.NodeID, "container", n.ContainerName)
+			if err := s.st.SetNotificationCardState(n.ID, model.CardPending); err != nil {
+				s.log.Warn("重置陈旧的通知状态失败", "err", err)
+			}
+			n.CardState = model.CardPending
+		}
+		// 合并提醒（一个 compose 项目里的多个容器）走批处理：
+		// 依次重建，一次一个，中途失败就停在那一个上。
+		if n.IsGroup() {
+			return s.startBatch(n)
+		}
+		// 远端节点的更新要下发指令到那台机器，走的是完全另一条路。
+		if n.NodeID > 0 {
+			return s.applyRemoteUpdate(n)
 		}
 		taskID, err := s.TriggerUpdate(n, string(from))
 		if err != nil {
+			// 本地失败同样要把原因写到库里：卡片外观会随消息刷新丢掉，
+			// 而网页上这条记录会一直留着，得让它自己说得清为什么没动。
+			if serr := s.st.SetNotificationCardResult(n.ID, model.CardFailed, "更新失败："+err.Error()); serr != nil {
+				s.log.Warn("更新通知状态失败", "err", serr)
+			}
 			return actionOutcome{Toast: "无法更新", State: model.CardFailed, Detail: err.Error()}
 		}
 		return actionOutcome{
@@ -1195,37 +1282,626 @@ func (s *Service) applyAction(n *model.Notification, action string, from model.C
 // 「现在仓库里这一版」，以最新观测为准更稳妥（期间要是又推了一版，下一轮该提醒还得提醒）。
 // 记录失败不影响回调返回 —— 按钮已经点了，消息状态也改了，这里只是尽力而为，
 // 真失败了顶多下次再被提醒一遍。
+// applyRemoteUpdate 处理远端提醒上的「更新」按钮。
+//
+// 与本地更新的区别只有一点：不建本地任务、不碰本机 Docker，而是把指令
+// 下发给那台机器。结果的回写走 NodeOpEvent —— Agent 那边跑完才会发 event 帧，
+// 这里只负责把卡片从「待更新」翻成「更新中」。
+func (s *Service) applyRemoteUpdate(n *model.Notification) actionOutcome {
+	s.remoteMu.RLock()
+	r := s.remote
+	s.remoteMu.RUnlock()
+	if r == nil {
+		return actionOutcome{Toast: "无法更新", Detail: "远端更新能力未就绪，请重启服务后再试"}
+	}
+	if !r.Online(n.NodeID) {
+		// 不改卡片状态：节点离线是暂时的，标成「失败」反而要用户去清。
+		// 卡片保持待更新，等那台机器回来再点一次就行。
+		return actionOutcome{Toast: "节点不在线，稍后再试"}
+	}
+	where := n.NodeName
+	if where == "" {
+		where = "远程节点"
+	}
+	// 「更新中」必须先落库，再下发指令。
+	//
+	// 卡片上那个「正在更新」只是这次回调的响应里换的一版外观，库里并没有跟着变。
+	// 而节点跑完以后回传 done 时，Hub 是拿 card_state='updating' 去认这条通知的
+	// （见 NodeOpEvent）——库里还停在 pending 就一条也找不到，卡片便永远停在
+	// 「正在更新」：网页横幅早就绿了，消息里一动不动。
+	//
+	// 放在下发之前还有个原因：Agent 受理得很快，done 事件有可能比这个函数返回更早。
+	if err := s.st.SetNotificationCardState(n.ID, model.CardUpdating); err != nil {
+		s.log.Warn("更新通知状态失败", "err", err)
+	}
+	msg, resolved, err := r.UpdateContainer(n.NodeID, n.ContainerID, n.ContainerName)
+	if err != nil {
+		detail := "在 " + where + " 上执行更新失败：" + err.Error()
+		// 说明一起落库。否则网页上只剩一个「失败」徽章，用户不知道该改什么，
+		// 也没法把原因贴出来；卡片那边一旦被新消息盖过去，线索就彻底没了。
+		if serr := s.st.SetNotificationCardResult(n.ID, model.CardFailed, detail); serr != nil {
+			s.log.Warn("更新通知状态失败", "err", serr)
+		}
+		return actionOutcome{
+			Toast:  "无法更新",
+			State:  model.CardFailed,
+			Detail: detail,
+		}
+	}
+	// 下发时按名字找回了容器，说明提醒里的编号已经过期（容器被重建过）。
+	// 必须把新编号写回这条通知：节点回传的结果带的是新编号，
+	// 不写回就永远匹配不上，卡片会一直停在「正在更新」。
+	if resolved != nil && resolved.ContainerID != "" && resolved.ContainerID != n.ContainerID {
+		if serr := s.st.RealignNotificationContainer(n.ID, n.ContainerName, resolved.ContainerID); serr != nil {
+			s.log.Warn("对齐通知里的容器编号失败", "notif", n.ID, "err", serr)
+		}
+		s.log.Info("提醒里的容器编号已过期，按容器名对齐到当前实例",
+			"notif", n.ID, "container", n.ContainerName,
+			"old", shortContainerID(n.ContainerID), "new", shortContainerID(resolved.ContainerID))
+	}
+	return actionOutcome{
+		Toast:  "已开始更新",
+		State:  model.CardUpdating,
+		Detail: msg + "\n正在 " + where + " 上重建容器，完成后本条消息会自动更新结果。",
+	}
+}
+
+// updateStillRunning 这条通知对应的更新是否真的还在跑。
+//
+// 本地查有没有进行中的任务，远端问一句节点当前的操作状态。
+// 查不出来（比如远端能力没注入）一律按「没在跑」处理 —— 那种情况下
+// 卡片本来也没有别的出路，重新下发一次至少能让它走到结果。
+func (s *Service) updateStillRunning(n *model.Notification) bool {
+	if n.NodeID > 0 {
+		s.remoteMu.RLock()
+		r := s.remote
+		s.remoteMu.RUnlock()
+		return r != nil && r.Busy(n.NodeID)
+	}
+	if n.IsGroup() {
+		// 合并提醒里正在跑的可能是任何一个成员，逐个问一遍。
+		for _, m := range n.AllMembers() {
+			if m.ContainerID == "" {
+				continue
+			}
+			if busy, err := s.st.HasRunningTask(m.ContainerID); err == nil && busy {
+				return true
+			}
+		}
+		return false
+	}
+	if n.ContainerID == "" {
+		return false
+	}
+	busy, err := s.st.HasRunningTask(n.ContainerID)
+	return err == nil && busy
+}
+
+// ApplyUpdate 在网页上对一条提醒手动执行更新。
+//
+// 待处理和「更新中」都能点：前者正常下发，后者先确认是不是真在跑 ——
+// 还在跑就拒绝，早就结束（进程重启、断线、旧版本没把状态写进库）就重新下发一次。
+// 失败与已回滚的也能点：那次失败很可能是临时的（镜像源抽了一下、目标机磁盘满），
+// 修好之后最自然的动作就是原地点一次重来，而不是先把记录删掉再等下一轮巡检。
+//
+// 走的是与 IM 卡片按钮完全相同的 applyAction，只是那边有卡片可回写、
+// 这边把结论整理成一句话返回给页面。库里状态同样会被推进到 updating，
+// 所以节点跑完回传结果时，那张 IM 卡片也能跟着翻成最终状态。
+func (s *Service) ApplyUpdate(n *model.Notification) (string, error) {
+	switch n.CardState {
+	case model.CardPending, model.CardUpdating, model.CardFailed, model.CardRollback:
+	default:
+		return "", errors.New("这条提醒已经处理过了，不需要再更新")
+	}
+	if n.CardState == model.CardUpdating && s.updateStillRunning(n) {
+		return "", errors.New("这次更新还在进行中，等它跑完再看结果")
+	}
+	out := s.applyAction(n, ActionUpdate, "")
+	switch out.State {
+	case model.CardFailed:
+		return "", errors.New(out.Detail)
+	case "":
+		// 状态没变：节点离线、重复点击之类被挡下来的情况。这类拒绝的原因
+		// 只在 Toast 里（比如「节点不在线，稍后再试」），以前这里直接返回
+		// 一句空字符串加 nil，页面照样弹「已下发更新」—— 用户以为动了，
+		// 实际上那条提醒还停在原位，只能一头雾水地再点一次。
+		if out.Toast == "" {
+			return "", errors.New("这条提醒暂时无法更新")
+		}
+		return "", errors.New(out.Toast)
+	}
+	return out.Detail, nil
+}
+
+// startBatch 开始一次「整个项目依次更新」。
+//
+// 一次只动一个容器：底层更新器本来就是单飞的，并发重建同一台机器上的
+// 多个容器既抢端口又抢容器名，出了错还分不清是谁的锅。串行慢一点，
+// 但每一步都有确定的结果，失败也能准确说清停在哪一个。
+func (s *Service) startBatch(n *model.Notification) actionOutcome {
+	members := n.AllMembers()
+	if len(members) == 0 {
+		return actionOutcome{Toast: "无法更新", State: model.CardFailed,
+			Detail: "这条提醒里没有可更新的容器，删掉它等下一轮巡检重新提醒即可。"}
+	}
+	// 已有另一批在跑：不起第二批，否则第一个成员就会撞「已有任务在执行」。
+	// 这里不写库、不改状态 —— 状态没变，就不该让用户以为点了生效。
+	if !s.batchMu.TryLock() {
+		return actionOutcome{Toast: "已有更新在跑", State: model.CardUpdating,
+			Detail: "另一批更新还没跑完，等它结束后再点；这次没有重复下发。"}
+	}
+	names := batchNames(members)
+	if err := s.st.SetNotificationCardResult(n.ID, model.CardUpdating, "正在依次更新："+names); err != nil {
+		s.log.Warn("更新通知状态失败", "err", err)
+	}
+	s.log.Info("开始批量更新", "notif", n.ID, "project", n.ComposeProject,
+		"containers", len(members), "node", n.NodeID)
+	go s.runBatch(n)
+
+	return actionOutcome{
+		Toast:  "已开始更新",
+		State:  model.CardUpdating,
+		Detail: fmt.Sprintf("已受理，正在依次更新 %d 个容器（%s），一次一个。\n全部结束后本条消息会显示结果。", len(members), names),
+	}
+}
+
+// runBatch 依次更新一条合并提醒里的全部容器。
+//
+// 分两段：**先把整批镜像拉齐，再逐个重建**。
+//
+// 为什么不在每个成员里「拉一个建一个」：第一个成员拉到一半失败时，前面
+// 已经重建的容器就是新版了，而后面还没动的仍是旧版 —— 一个 compose 项目
+// 停在新旧混搭上，旧的回不去、新的互相还起不来。预拉阶段只动镜像、不碰
+// 容器，失败时整批原样不动，用户换个加速源再点一次就行。
+func (s *Service) runBatch(n *model.Notification) {
+	defer s.batchMu.Unlock()
+
+	// 一个项目 6 个容器，单个最多能跑 45 分钟，整体给足 3 小时。
+	ctx, cancel := context.WithTimeout(s.baseCtx, 3*time.Hour)
+	defer cancel()
+
+	members := n.AllMembers()
+	// 先按 depends_on 排序再动手：下游先重建会撞上上游正在重启的那几秒，
+	// 表现为「更新完网页打不开 / 502」。排不出依赖时原样返回。
+	members = s.sortMembersByDeps(n, members)
+	total := len(members)
+	if total == 0 {
+		s.finishBatch(n, model.CardFailed, "这条提醒里没有可更新的容器，删掉它等下一轮巡检重新提醒即可。")
+		return
+	}
+
+	// 预拉可能要几分钟，先把卡片上的话换成「拉取镜像」，
+	// 否则用户看到的一直是「正在依次更新」，而容器一个都没动。
+	if err := s.st.SetNotificationCardResult(n.ID, model.CardUpdating,
+		fmt.Sprintf("正在拉取 %d 个容器的镜像，拉齐后开始逐个重建（这一步不会改动容器）。", total)); err != nil {
+		s.log.Warn("写回通知状态失败", "notif", n.ID, "err", err)
+	}
+
+	if name, err := s.preloadBatch(ctx, n, members); err != nil {
+		who := name
+		if who == "" {
+			who = "本机"
+		}
+		s.finishBatch(n, model.CardFailed, preloadFailDetail(total, who, err))
+		return
+	}
+
+	done := 0
+	var failed *model.NotificationMember
+
+	for i := range members {
+		m := members[i]
+		if m.State == "done" {
+			// 上次跑到一半断掉了，已经成功的不要重跑一遍。
+			done++
+			continue
+		}
+		if err := s.st.UpdateNotificationMemberState(n.ID, m.ContainerID, "updating", ""); err != nil {
+			s.log.Warn("记录成员状态失败", "notif", n.ID, "container", m.ContainerName, "err", err)
+		}
+		var err error
+		if n.NodeID > 0 {
+			err = s.runRemoteMember(ctx, n, &m)
+		} else {
+			err = s.runLocalMember(ctx, &m)
+		}
+		if err != nil {
+			m.Error = err.Error()
+			_ = s.st.UpdateNotificationMemberState(n.ID, m.ContainerID, "failed", m.Error)
+			failed = &m
+			break
+		}
+		_ = s.st.UpdateNotificationMemberState(n.ID, m.ContainerID, "done", "")
+		done++
+		s.log.Info("合并提醒里的一个容器更新完成", "notif", n.ID,
+			"container", m.ContainerName, "progress", fmt.Sprintf("%d/%d", done, total))
+	}
+
+	state := model.CardDone
+	detail := fmt.Sprintf("%d 个容器已全部更新完成，原有挂载、端口与网络配置保持不变。", done)
+	if failed != nil {
+		state = model.CardFailed
+		detail = fmt.Sprintf("已更新 %d/%d 个容器；%s 失败：%s\n其余容器保持待更新，处理完可以点「重试更新」，已成功的不会重跑。",
+			done, total, failed.ContainerName, failed.Error)
+	} else if done < total {
+		state = model.CardFailed
+		detail = fmt.Sprintf("只完成了 %d/%d 个容器就中断了，点「重试更新」可以接着来。", done, total)
+	}
+	s.finishBatch(n, state, detail)
+}
+
+// preloadBatch 把这条提醒里所有待更新容器的镜像先拉下来。
+//
+// 返回出问题的容器名与原因。全部成功才有资格动容器。
+//
+// 旧 Agent 不认识预拉指令，回的是「不支持的指令」。那不是故障，是版本差：
+// 认出来就整体跳过预拉，退回逐个「拉+建」，不能让一次版本差把整批挡死。
+func (s *Service) preloadBatch(ctx context.Context, n *model.Notification, members []model.NotificationMember) (string, error) {
+	// 目标上还有别的更新在跑：预拉也要抢同一把锁，先在整体上说清楚，
+	// 否则会变成「拉第一个就报已有任务在执行」，看着像是这批自己的问题。
+	// 本机和远端各判一次 —— 远端那台机器上可能是网页上刚点的一批还在跑。
+	if n.NodeID == 0 {
+		if s.up != nil && s.up.Busy() {
+			return "", &hubproto.BusyError{}
+		}
+	} else if s.remoteBusy(n.NodeID) {
+		return "", &hubproto.BusyError{Where: n.NodeName}
+	}
+	for i := range members {
+		m := members[i]
+		if m.State == "done" {
+			continue
+		}
+		var err error
+		if n.NodeID > 0 {
+			err = s.preloadRemote(ctx, n, &m)
+		} else {
+			err = s.preloadLocal(ctx, &m)
+		}
+		if err == nil {
+			continue
+		}
+		if unsupportedAction(err) {
+			s.log.Info("节点上的 Agent 不支持预拉，退回逐个更新", "notif", n.ID, "node", n.NodeID)
+			return "", nil
+		}
+		return m.ContainerName, err
+	}
+	return "", nil
+}
+
+// preloadLocal 在本机拉一个成员的镜像，不重建容器。
+func (s *Service) preloadLocal(ctx context.Context, m *model.NotificationMember) error {
+	taskID, err := s.st.CreateTask(&model.Task{
+		ImageRef:      m.ImageRef,
+		ContainerID:   m.ContainerID,
+		ContainerName: m.ContainerName,
+		// 「更新历史」里直接显示这一列，写清楚这是批量更新前的预拉，
+		// 免得用户看到一串「更新成功」以为容器已经被重建过了。
+		TriggeredBy: "预拉",
+	})
+	if err != nil {
+		return fmt.Errorf("创建拉取任务失败: %w", err)
+	}
+	return s.up.Pull(ctx, updater.PullRequest{
+		TaskID:   taskID,
+		ImageRef: s.memberTarget(m),
+		Preload:  true,
+	})
+}
+
+// preloadFailDetail 预拉阶段没拉到镜像时，卡片上那句话。
+//
+// 两种原因必须分开劝：真拉不到（403、超时）才该换加速源；要是撞上另一把锁，
+// 换多少加速源都没用 —— 那批镜像其实正在往机器上写，等它跑完再点就行。
+// 把两者写成同一句话，用户只会反复换源、反复失败。
+func preloadFailDetail(total int, who string, err error) string {
+	if hubproto.IsBusy(err) {
+		return fmt.Sprintf(
+			"这批更新没有开始，%d 个容器一个都没有改动：\n%s：%s\n这跟镜像源无关，等那边跑完再点「重试更新」即可。",
+			total, who, err)
+	}
+	return fmt.Sprintf(
+		"拉取镜像失败，%d 个容器一个都没有改动：\n%s：%s\n换个镜像加速源、或等源恢复后再点「重试更新」即可。",
+		total, who, err)
+}
+
+// remoteBusy 那台机器上是否已经有一个任务在跑（本批之外）。
+func (s *Service) remoteBusy(nodeID int64) bool {
+	s.remoteMu.RLock()
+	r := s.remote
+	s.remoteMu.RUnlock()
+	return r != nil && r.Busy(nodeID)
+}
+
+// preloadRemote 让节点拉一个成员的镜像，不重建容器。
+//
+// **必须等这个镜像真的拉完再返回**。Agent 一把锁，回执「开始拉取镜像」只代表
+// 受理，不等于拉完了：下一个成员紧接着下发，当场被挡成「已有更新任务正在执行」，
+// 而镜像其实正在往那台机器上写。用户看到的就是「明明在拉，却报错，还让我换加速源」。
+func (s *Service) preloadRemote(ctx context.Context, n *model.Notification, m *model.NotificationMember) error {
+	s.remoteMu.RLock()
+	r := s.remote
+	s.remoteMu.RUnlock()
+	if r == nil {
+		return errors.New("远端更新能力未就绪，请重启服务后再试")
+	}
+	if !r.Online(n.NodeID) {
+		return errors.New("节点不在线")
+	}
+	startedAt := time.Now()
+	if err := r.PullContainer(n.NodeID, m.ContainerID, m.ContainerName); err != nil {
+		return err
+	}
+	return s.waitRemoteOp(ctx, n.NodeID, startedAt, "拉取 "+m.ContainerName+" 的镜像")
+}
+
+// memberTarget 推一个成员该拉到哪个引用。
+//
+// 与 updateTarget 同一套判断，只是数据来自成员行而不是通知主字段：
+// 合并提醒里每个容器自己的最新 tag 不一样（postgres 15.18、tengine 9.4.7）。
+func (s *Service) memberTarget(m *model.NotificationMember) string {
+	if m.LatestTag == "" {
+		return m.ImageRef
+	}
+	ref, err := registry.ParseReference(m.ImageRef)
+	if err != nil || version.Compare(m.LatestTag, ref.Tag) <= 0 {
+		return m.ImageRef
+	}
+	return ref.WithTag(m.LatestTag)
+}
+
+// unsupportedAction 判断节点是不是根本不认识这条指令（Agent 版本过旧）。
+func unsupportedAction(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "不支持的指令")
+}
+
+// finishBatch 写回整批的最终结果，并把所有投递过的卡片改成同一个样子。
+func (s *Service) finishBatch(n *model.Notification, state model.CardState, detail string) {
+	if err := s.st.SetNotificationCardResult(n.ID, state, detail); err != nil {
+		s.log.Warn("写回批量更新结果失败", "notif", n.ID, "err", err)
+	}
+	_ = s.st.MarkNotificationRead(n.ID, true)
+
+	editCtx, cancelEdit := context.WithTimeout(s.baseCtx, 30*time.Second)
+	defer cancelEdit()
+	for _, d := range s.deliveryTargets(n) {
+		s.editDelivery(editCtx, n, d, state, detail)
+	}
+	s.log.Info("批量更新结束", "notif", n.ID, "project", n.ComposeProject, "state", state)
+}
+
+// runLocalMember 重建本机的一个容器，阻塞到出结果。
+func (s *Service) runLocalMember(ctx context.Context, m *model.NotificationMember) error {
+	local := &model.Notification{
+		ContainerID:   m.ContainerID,
+		ContainerName: m.ContainerName,
+		ImageRef:      m.ImageRef,
+		LocalTag:      m.LocalTag,
+		LatestTag:     m.LatestTag,
+	}
+	taskID, err := s.createUpdateTask(local, "batch")
+	if err != nil {
+		return err
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.executeUpdate(local, taskID, "batch") }()
+
+	select {
+	case <-ctx.Done():
+		return errors.New("等待更新结果超时")
+	case runErr := <-errCh:
+		if runErr == nil {
+			return nil
+		}
+		// 回滚要说得更具体：用户看到的应该是「已经退回去了」，
+		// 而不是一句干巴巴的健康检查失败。
+		if t, terr := s.st.GetTask(taskID); terr == nil && t.Status == model.TaskRolledBack {
+			return fmt.Errorf("新容器未通过健康检查，已回滚到原版本：%v", runErr)
+		}
+		return runErr
+	}
+}
+
+// runRemoteMember 让节点重建一个容器，并等它出结果。
+func (s *Service) runRemoteMember(ctx context.Context, n *model.Notification, m *model.NotificationMember) error {
+	s.remoteMu.RLock()
+	r := s.remote
+	s.remoteMu.RUnlock()
+	if r == nil {
+		return errors.New("远端更新能力未就绪，请重启服务后再试")
+	}
+	if !r.Online(n.NodeID) {
+		return errors.New("节点不在线")
+	}
+	startedAt := time.Now()
+	_, resolved, err := r.UpdateContainer(n.NodeID, m.ContainerID, m.ContainerName)
+	if err != nil {
+		return err
+	}
+	// 编号过期（容器被重建过）时按名字找回了新编号，写回提醒与成员行，
+	// 否则后面的事件对不上这条提醒。
+	if resolved != nil && resolved.ContainerID != "" && resolved.ContainerID != m.ContainerID {
+		if serr := s.st.RealignNotificationContainer(n.ID, m.ContainerName, resolved.ContainerID); serr != nil {
+			s.log.Warn("对齐通知里的容器编号失败", "notif", n.ID, "err", serr)
+		}
+		m.ContainerID = resolved.ContainerID
+	}
+	return s.waitRemoteOp(ctx, n.NodeID, startedAt, "重建 "+m.ContainerName)
+}
+
+// waitRemoteOp 等节点上这一轮操作跑出结果。startedAt 是下发指令**之前**取的时刻。
+//
+// 重建和预拉都要等：Agent 一把锁，回执只代表受理，前一个还在跑就下发下一个，
+// 会被当场挡回来（见 preloadRemote 的注释）。
+//
+// 不能用「Busy 变 false 就算完」：下发后事件要过几百毫秒才到，那会儿 Busy
+// 还是 false，会被当成「已经结束」。所以先看有没有开始时间不早于下发时刻的结果，
+// 再看 Busy 是否起落过。
+//
+// what 只进超时那句话（「重建 safeline-mgt：等待节点回传结果超时」），
+// 一批六七个容器的时候，光一句「超时」根本分不清卡在哪一个。
+func (s *Service) waitRemoteOp(ctx context.Context, nodeID int64, startedAt time.Time, what string) error {
+	s.remoteMu.RLock()
+	r := s.remote
+	s.remoteMu.RUnlock()
+	if r == nil {
+		return errors.New("远端更新能力未就绪，请重启服务后再试")
+	}
+
+	deadline := time.Now().Add(45 * time.Minute)
+	sawBusy := false
+	for {
+		phase, msg, updatedAt := r.OpResult(nodeID)
+		// 用「不早于」而不是「晚于」：Windows 上 time.Now() 的分辨率可以粗到
+		// 十几毫秒，下发与事件落在同一个刻度里时 After 是 false —— 明明跑完了，
+		// 这里却一直等下去，整批更新就那么卡在「更新中」。
+		if !updatedAt.IsZero() && !updatedAt.Before(startedAt) {
+			switch phase {
+			case hubproto.PhaseDone:
+				return nil
+			case hubproto.PhaseFailed:
+				if msg == "" {
+					msg = "节点没有说明原因，可到节点页查看 Agent 日志"
+				}
+				return errors.New(msg)
+			}
+		}
+		if r.Busy(nodeID) {
+			sawBusy = true
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s：等待节点回传结果超时", what)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%s：等待节点回传结果超时", what)
+		case <-time.After(time.Second):
+		}
+		// 超过一分钟还没看到任何动静，说明指令被吞了（Agent 卡住、断线）。
+		if !sawBusy && time.Since(startedAt) > time.Minute {
+			return fmt.Errorf("%s：节点没有回传更新进度，稍后到节点页确认状态", what)
+		}
+	}
+}
+
+// batchNames 合并提醒里各容器名的紧凑写法，用于卡片与日志。
+func batchNames(members []model.NotificationMember) string {
+	const limit = 4
+	names := make([]string, 0, limit)
+	for _, m := range members {
+		if len(names) >= limit {
+			break
+		}
+		if m.ContainerName != "" {
+			names = append(names, m.ContainerName)
+		}
+	}
+	out := strings.Join(names, "、")
+	if len(members) > len(names) {
+		out += fmt.Sprintf(" 等 %d 个", len(members))
+	}
+	return out
+}
+
+// NodeOpEvent 处理远端更新的进度，把最终结果写回卡片。
+//
+// 只认 done / failed：中间那些「拉取镜像、停止旧容器」既没有必要刷到卡片上
+// （会不停闪烁），也不改变任何状态。
+func (s *Service) NodeOpEvent(nodeID int64, ev hubproto.Event) {
+	if ev.Phase != hubproto.PhaseDone && ev.Phase != hubproto.PhaseFailed {
+		return
+	}
+	list, err := s.st.ListUpdatingNodeNotifications(nodeID, ev.ContainerID, ev.ContainerName)
+	if err != nil {
+		s.log.Warn("查询节点通知失败", "node_id", nodeID, "err", err)
+		return
+	}
+	if len(list) == 0 {
+		// 卡片可能已经被用户标成已读或忽略（那就不再改它），也可能是从网页发起的
+		// 更新，本来就没有卡片。两种情况都不需要做什么。
+		return
+	}
+
+	state := model.CardDone
+	detail := "容器已在新镜像上重建完成，原有挂载、端口与网络配置保持不变。"
+	if ev.Phase == hubproto.PhaseFailed {
+		state = model.CardFailed
+		detail = "更新失败：" + ev.Message
+		if detail == "更新失败：" {
+			detail = "更新失败，节点没有说明原因，可到节点页查看 Agent 日志。"
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(s.baseCtx, 30*time.Second)
+	defer cancel()
+	for i := range list {
+		n := &list[i]
+		if n.IsGroup() {
+			// 合并提醒的结果由批处理统一写：这里给单个成员写一次「完成」，
+			// 会把整条卡片提前标成完成，后面几个容器还在跑。
+			continue
+		}
+		if err := s.st.SetNotificationCardResult(n.ID, state, detail); err != nil {
+			s.log.Warn("写回节点通知状态失败", "id", n.ID, "err", err)
+		}
+		_ = s.st.MarkNotificationRead(n.ID, true)
+		for _, d := range s.deliveryTargets(n) {
+			s.editDelivery(ctx, n, d, state, detail)
+		}
+	}
+	s.log.Info("节点更新结果已写回卡片", "node_id", nodeID,
+		"container", ev.ContainerName, "phase", ev.Phase, "cards", len(list))
+}
+
 // rememberIgnored 把「用户放行了这一版」记到监控项上。
 //
 // 两种更新的记法不一样：更高版本 tag 记在 notified_tag，同 tag 内容变化记在
 // ignored_digest。按 kind 分流，别混着写 —— new_tag 场景手上只有旧 tag 的
 // 摘要，拿它当「已放行的内容」会把后面真正的更新一并压掉。
 func (s *Service) rememberIgnored(n *model.Notification) {
-	img := s.findImageForNotification(n)
-	if img == nil {
-		s.log.Warn("找不到对应的监控项，无法记录已忽略版本",
-			"ref", n.ImageRef, "container", n.ContainerID)
-		return
-	}
-	if n.Kind == model.NotifNewTag && n.LatestTag != "" {
-		if err := s.st.SetImageNotified(img.ID, n.LatestTag, ""); err != nil {
-			s.log.Warn("记录已忽略版本失败", "ref", n.ImageRef, "err", err)
+	// 合并提醒里每个容器各记各的：只记主字段那一个，项目里剩下的
+	// 下一轮会原样再推一遍 —— 用户刚点完「忽略」，屏幕上又冒出同一批。
+	for _, m := range n.AllMembers() {
+		kind := m.Kind
+		if kind == "" {
+			kind = n.Kind
 		}
-		// 摘要也照写：页面上那个「已忽略本版本」徽章与「恢复提醒」按钮
-		// 都靠它判断。少了这一步，用户点完忽略回到列表里还是「有更新」，
-		// 只会以为按钮没生效，再点第二次。
-		if img.RemoteDigest != "" {
-			if err := s.st.SetImageIgnoredDigest(img.ID, img.RemoteDigest); err != nil {
-				s.log.Warn("记录已忽略摘要失败", "ref", n.ImageRef, "err", err)
+		img, err := s.st.FindImageByContainer(m.ContainerID)
+		if err != nil || img == nil {
+			img = s.findImageForNotification(&model.Notification{
+				ImageRef: m.ImageRef, ContainerID: m.ContainerID,
+			})
+		}
+		if img == nil {
+			s.log.Warn("找不到对应的监控项，无法记录已忽略版本",
+				"ref", m.ImageRef, "container", m.ContainerID)
+			continue
+		}
+		latest := m.LatestTag
+		if latest == "" {
+			latest = n.LatestTag
+		}
+		if kind == model.NotifNewTag && latest != "" {
+			if err := s.st.SetImageNotified(img.ID, latest, ""); err != nil {
+				s.log.Warn("记录已忽略版本失败", "ref", m.ImageRef, "err", err)
 			}
+			// 摘要也照写：页面上那个「已忽略本版本」徽章与「恢复提醒」按钮
+			// 都靠它判断。少了这一步，用户点完忽略回到列表里还是「有更新」，
+			// 只会以为按钮没生效，再点第二次。
+			if img.RemoteDigest != "" {
+				if err := s.st.SetImageIgnoredDigest(img.ID, img.RemoteDigest); err != nil {
+					s.log.Warn("记录已忽略摘要失败", "ref", m.ImageRef, "err", err)
+				}
+			}
+			continue
 		}
-		return
-	}
-	if img.RemoteDigest == "" {
-		return
-	}
-	if err := s.st.SetImageIgnoredDigest(img.ID, img.RemoteDigest); err != nil {
-		s.log.Warn("记录已忽略版本失败", "ref", n.ImageRef, "err", err)
+		if img.RemoteDigest == "" {
+			continue
+		}
+		if err := s.st.SetImageIgnoredDigest(img.ID, img.RemoteDigest); err != nil {
+			s.log.Warn("记录已忽略版本失败", "ref", m.ImageRef, "err", err)
+		}
 	}
 }
 
@@ -1249,6 +1925,25 @@ func (s *Service) findImageForNotification(n *model.Notification) *model.Image {
 // TriggerUpdate 创建并异步执行一次更新任务，返回任务 ID。
 // 三个入口（飞书按钮 / Telegram 按钮 / Web 页面）共用这一处，行为才保证一致。
 func (s *Service) TriggerUpdate(n *model.Notification, triggeredBy string) (int64, error) {
+	taskID, err := s.createUpdateTask(n, triggeredBy)
+	if err != nil {
+		return 0, err
+	}
+	if n.ID > 0 {
+		if err := s.st.SetNotificationCardState(n.ID, model.CardUpdating); err != nil {
+			s.log.Warn("更新通知状态失败", "err", err)
+		}
+	}
+
+	go s.runUpdate(n, taskID, triggeredBy)
+	return taskID, nil
+}
+
+// createUpdateTask 做可行性检查并落一条任务，不启动执行。
+//
+// 单条更新与合并提醒的批处理共用它：检查口径必须一处，否则会出现
+// 「单条能更、批量报已有任务」这种一半好一半坏的状态。
+func (s *Service) createUpdateTask(n *model.Notification, triggeredBy string) (int64, error) {
 	if n.ContainerID == "" {
 		return 0, errors.New("该监控项没有关联的本地容器，无法执行更新")
 	}
@@ -1271,18 +1966,14 @@ func (s *Service) TriggerUpdate(n *model.Notification, triggeredBy string) (int6
 		s.log.Error("创建更新任务失败", "err", err)
 		return 0, fmt.Errorf("创建更新任务失败: %w", err)
 	}
-	if n.ID > 0 {
-		if err := s.st.SetNotificationCardState(n.ID, model.CardUpdating); err != nil {
-			s.log.Warn("更新通知状态失败", "err", err)
-		}
-	}
-
-	go s.runUpdate(n, taskID, triggeredBy)
 	return taskID, nil
 }
 
-// runUpdate 在后台执行更新，并把最终结果写回原消息。
-func (s *Service) runUpdate(n *model.Notification, taskID int64, triggeredBy string) {
+// executeUpdate 真正跑一次重建，阻塞到结束。
+//
+// 与 runUpdate 分开是因为批处理只想拿到「成没成」，不想要「写卡片」那一段：
+// 一批 6 个容器，每动一个就改一次卡片没有任何意义，结果统一在收尾时写。
+func (s *Service) executeUpdate(n *model.Notification, taskID int64, triggeredBy string) error {
 	ctx, cancel := context.WithTimeout(s.baseCtx, 45*time.Minute)
 	defer cancel()
 
@@ -1290,13 +1981,18 @@ func (s *Service) runUpdate(n *model.Notification, taskID int64, triggeredBy str
 	s.log.Info("开始执行更新", "task", taskID, "container", n.ContainerName,
 		"from", n.ImageRef, "target", target, "by", triggeredBy)
 
-	err := s.up.Run(ctx, updater.Request{
+	return s.up.Run(ctx, updater.Request{
 		TaskID:        taskID,
 		ImageRef:      target,
 		ContainerID:   n.ContainerID,
 		ContainerName: n.ContainerName,
 		TriggeredBy:   triggeredBy,
 	})
+}
+
+// runUpdate 在后台执行更新，并把最终结果写回原消息。
+func (s *Service) runUpdate(n *model.Notification, taskID int64, triggeredBy string) {
+	err := s.executeUpdate(n, taskID, triggeredBy)
 
 	state := model.CardDone
 	detail := "容器已在新镜像上重建完成，原有挂载、端口与网络配置保持不变。"
@@ -1310,7 +2006,7 @@ func (s *Service) runUpdate(n *model.Notification, taskID int64, triggeredBy str
 	}
 
 	if n.ID > 0 {
-		if serr := s.st.SetNotificationCardState(n.ID, state); serr != nil {
+		if serr := s.st.SetNotificationCardResult(n.ID, state, detail); serr != nil {
 			s.log.Warn("写回通知状态失败", "err", serr)
 		}
 		_ = s.st.MarkNotificationRead(n.ID, true)
@@ -1434,4 +2130,12 @@ func (s *Service) SendTestTelegram(ctx context.Context) error {
 	}
 	_, err := s.tg.SendMessage(ctx, chatID, telegram.BuildTestMessage(chatID))
 	return err
+}
+
+// shortContainerID 日志里只留前十来位。完整编号 64 个字符，一行日志会被它撑满。
+func shortContainerID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }

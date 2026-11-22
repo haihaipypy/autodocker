@@ -5,6 +5,7 @@
 package hubserver
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -38,6 +39,34 @@ type Config struct {
 	// ScanInterval 建议 Agent 使用的扫描间隔（秒）。0 表示不干预，
 	// 沿用 Agent 自己的配置。
 	ScanInterval int
+
+	// Notifier 推送更新提醒的能力，由通知服务实现。
+	//
+	// 远端容器发现更新时，提醒由 **Hub** 统一发：渠道凭据配在 Hub 上，
+	// Agent 那边一个都不该有。留空时只落库不推送（测试与未配渠道的场景）。
+	Notifier Notifier
+
+	// OnOp 每次收到节点的操作进度时回调，用来把「更新到哪一步了」写回卡片。
+	//
+	// 用回调而不是让 hubserver 直接依赖通知服务：两者本来就该互不认识，
+	// 一个是 WS 端点，一个是渠道编排，硬连起来只会绕成一圈。
+	OnOp func(nodeID int64, ev hubproto.Event)
+
+	// AgentImage 镜像方式安装的节点升级时要拉的目标镜像（形如
+	// haihaipypy/autodocker:1.8.4）。二进制方式不需要它 —— 那种节点直接从
+	// Hub 拉同一份可执行文件。
+	AgentImage string
+
+	// AutoUpgrade 返回「是否允许自动升级节点」。
+	//
+	// 用回调而不是布尔值：这个开关在设置页随时可改，传值的话改完得重启才生效。
+	// 为 nil 表示不自动升级，只能由用户点按钮。
+	AutoUpgrade func() bool
+}
+
+// Notifier 推送一条提醒，返回平台侧消息 ID。
+type Notifier interface {
+	Notify(ctx context.Context, n *model.Notification) (string, error)
 }
 
 // Server WebSocket 服务端。
@@ -50,7 +79,59 @@ type Server struct {
 
 	mu    sync.RWMutex
 	conns map[int64]*conn
+
+	// 每个节点上正在进行的操作（目前只有更新）。
+	//
+	// 只放内存：这是「此刻在干什么」的瞬时状态，进程重启就没有意义了 ——
+	// 落库反而要处理「重启后一堆永远停在更新中」的残留。
+	opsMu sync.Mutex
+	ops   map[int64]*OpState
+
+	// 升级相关的瞬时状态，同样只放内存。
+	//
+	// 升级会把 Agent 停掉再拉起来，这中间没有任何连接可以记录状态；
+	// 唯一的持久事实是「节点回来时版本是多少」，所以这里只需要记住
+	// 「刚才想把它升到哪一版」，剩下的等它回来说。
+	upMu        sync.Mutex
+	upgrading   map[int64]upgradeState
+	lastUpgrade map[int64]hubproto.UpgradeResult
+	autoTries   map[int64]autoTry
+
+	// 批量更新（同一个 compose 项目一次点完）的状态，同样只放内存。
+	// 它比 Op 多的是「一共几个、跑到第几个」，页面靠它显示进度条式的文案。
+	batchMu sync.Mutex
+	batches map[int64]*BatchState
 }
+
+// OpState 一个节点上正在进行的操作，直接序列化给页面。
+type OpState struct {
+	OpID          string `json:"op_id"`
+	Kind          string `json:"kind"`
+	Phase         string `json:"phase"`
+	ContainerID   string `json:"container_id"`
+	ContainerName string `json:"container_name"`
+	Message       string `json:"message"`
+	TaskID        int64  `json:"task_id"` // Agent 本地库里的任务号，仅用于排查
+
+	// HubTaskID 这次操作在 Hub 库里对应的任务号。
+	//
+	// 和上面那个 TaskID 是两码事：Agent 自己也建了任务，但那份记录在它本地库里，
+	// Hub 读不到。让「更新历史」能显示远端任务，就得由 Hub 自己再记一份。
+	HubTaskID int64     `json:"hub_task_id"`
+	StartedAt time.Time `json:"started_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// 操作状态的保留时长。
+//
+// 完成态留 90 秒，是为了让页面至少有一次轮询能读到「更新完成」——
+// 立刻删掉的话，用户点完按钮只会看到横幅一闪而过，不知道成没成。
+// 进行中态 5 分钟没有任何更新就丢弃：Agent 崩了或者进程被 kill 时
+// 不会再有 event 帧，留着只会让页面永远停在「更新中」。
+const (
+	opDoneTTL    = 90 * time.Second
+	opRunningTTL = 5 * time.Minute
+)
 
 type conn struct {
 	nodeID int64
@@ -59,15 +140,25 @@ type conn struct {
 	writeMu sync.Mutex
 	once    sync.Once
 	done    chan struct{}
+
+	// 等待回执的指令。key 是指令 ID。
+	// 只有 SendWait 会用到；Send 那种「发完就不管」的指令不进这张表。
+	pendingMu sync.Mutex
+	pending   map[string]chan hubproto.Frame
 }
 
 // New 构造服务端。
 func New(cfg Config, st *store.Store, logger *slog.Logger) *Server {
 	return &Server{
-		cfg:   cfg,
-		st:    st,
-		log:   logger,
-		conns: map[int64]*conn{},
+		cfg:         cfg,
+		st:          st,
+		log:         logger,
+		conns:       map[int64]*conn{},
+		ops:         map[int64]*OpState{},
+		upgrading:   map[int64]upgradeState{},
+		lastUpgrade: map[int64]hubproto.UpgradeResult{},
+		autoTries:   map[int64]autoTry{},
+		batches:     map[int64]*BatchState{},
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout: 15 * time.Second,
 			ReadBufferSize:   4096,
@@ -105,6 +196,300 @@ func (s *Server) Send(nodeID int64, action string, data any) error {
 	}
 	id := fmt.Sprintf("c-%d-%d", nodeID, time.Now().UnixNano())
 	return c.write(hubproto.Frame{Type: hubproto.TypeCmd, ID: id, Action: action}, data)
+}
+
+// SendWait 下发指令并等待 Agent 回执，返回回执里的说明文字。
+//
+// 和 Send 的区别就是「等不等」。更新这种破坏性操作必须等：
+// 1.7.5 的 Agent 不认识 update，回执会是「不支持的指令」，页面要当场
+// 告诉用户「去目标机重跑一次安装命令」；而如果只是发完就算了，
+// 用户看到的会是横幅挂几分钟然后报一个看不懂的超时。
+func (s *Server) SendWait(nodeID int64, action string, data any, timeout time.Duration) (string, error) {
+	s.mu.RLock()
+	c := s.conns[nodeID]
+	s.mu.RUnlock()
+	if c == nil {
+		return "", errors.New("节点不在线，请稍后再试")
+	}
+
+	id := fmt.Sprintf("c-%d-%d", nodeID, time.Now().UnixNano())
+	ch := make(chan hubproto.Frame, 1)
+	c.addPending(id, ch)
+	defer c.dropPending(id)
+
+	if err := c.write(hubproto.Frame{Type: hubproto.TypeCmd, ID: id, Action: action}, data); err != nil {
+		return "", err
+	}
+
+	select {
+	case f := <-ch:
+		if !f.OK {
+			msg := f.Error
+			if msg == "" {
+				msg = "节点拒绝了这条指令"
+			}
+			return "", errors.New(msg)
+		}
+		var ack hubproto.CmdAck
+		_ = json.Unmarshal(f.Data, &ack)
+		return ack.Message, nil
+	case <-c.done:
+		return "", errors.New("节点连接已断开")
+	case <-time.After(timeout):
+		return "", errors.New("节点没有响应，可能是 Agent 版本过旧，请在目标机重跑一次安装命令")
+	}
+}
+
+// UpdateContainer 在指定节点上重建一个容器，返回受理说明。
+//
+// 网页上的「更新」按钮和通知卡片上的按钮都走这里：两条入口如果各拼一次指令，
+// 迟早会出现「网页能更、卡片点不动」这种一半好一半坏的状态。
+//
+// 指令里只带容器编号，镜像引用由 Agent 用自己那份巡检结果推导 ——
+// Hub 手上的快照本来就来自 Agent，再算一遍只是多一处可能算错的地方。
+//
+// 编号查不到时按容器名再找一次：编号只在「这一个容器实例」的生命周期里有效，
+// compose 重建、外部升级都会让它变掉，而提醒里存的是发提醒那一刻的编号。
+// 只认编号的话，用户在提醒上点「重试」永远只会得到「这台机器上找不到该容器」。
+//
+// 第二个返回值是实际下发的那个容器快照，调用方要用它把提醒上的编号对齐 ——
+// 节点跑完回传的事件带的是新编号，不写回通知，结果就永远对不上。
+func (s *Server) UpdateContainer(nodeID int64, containerID, containerName string) (string, *model.NodeContainer, error) {
+	if containerID == "" && containerName == "" {
+		return "", nil, errors.New("缺少容器标识")
+	}
+	c, err := s.st.FindNodeContainer(nodeID, containerID)
+	if err != nil {
+		c, err = s.st.FindNodeContainerByName(nodeID, containerName)
+	}
+	if err != nil {
+		return "", nil, errors.New("Hub 上没有这个容器的记录：可能刚被重建、快照还没更新，先到节点页刷新，等巡检回来再试")
+	}
+	msg, err := s.SendWait(nodeID, hubproto.ActionUpdate, hubproto.Cmd{
+		ContainerID:   c.ContainerID,
+		ContainerName: c.ContainerName,
+		ImageRef:      c.ImageRef,
+	}, 8*time.Second)
+	if err != nil {
+		return "", c, s.explainBusy(nodeID, err)
+	}
+	if msg == "" {
+		msg = "已开始更新"
+	}
+	return msg, c, nil
+}
+
+// PullContainer 只让节点把镜像拉下来，不重建容器。
+//
+// 批量更新的第一步用它先把整个项目的镜像拉齐。错误可能是三类，调用方要分清：
+// 节点不在线（不该继续）、找不到容器记录（快照过期）、以及「不支持的指令」
+// —— 那说明节点上的 Agent 还没升到支持预拉的版本，应当退化成逐个更新。
+func (s *Server) PullContainer(nodeID int64, containerID, containerName string) error {
+	if containerID == "" && containerName == "" {
+		return errors.New("缺少容器标识")
+	}
+	c, err := s.st.FindNodeContainer(nodeID, containerID)
+	if err != nil {
+		c, err = s.st.FindNodeContainerByName(nodeID, containerName)
+	}
+	if err != nil {
+		return errors.New("Hub 上没有这个容器的记录：可能刚被重建、快照还没更新，先到节点页刷新，等巡检回来再试")
+	}
+	_, err = s.SendWait(nodeID, hubproto.ActionPull, hubproto.Cmd{
+		ContainerID:   c.ContainerID,
+		ContainerName: c.ContainerName,
+		ImageRef:      c.ImageRef,
+	}, 8*time.Second)
+	return s.explainBusy(nodeID, err)
+}
+
+// explainBusy 把 Agent 那句「已有更新任务正在执行」翻成「谁在占着这台机器」。
+//
+// 那句原话里没有任何主体信息：用户刚点完一批更新，看到「已有任务在执行」
+// 只会以为是自己这一批出了问题。实际上多半是页面上或卡片上另一条指令
+// 还在拉镜像 —— 说清是谁、下一步该等什么，才不至于让人去换加速源瞎试。
+func (s *Server) explainBusy(nodeID int64, err error) error {
+	if !hubproto.IsBusy(err) {
+		return err
+	}
+	who := ""
+	if op := s.Op(nodeID); op != nil {
+		who = op.ContainerName
+	}
+	return &hubproto.BusyError{Who: who}
+}
+
+// errUnsupportedAction 判断节点是不是根本不认识这条指令。
+//
+// 旧 Agent 的指令白名单只有 scan / update / upgrade，收到 pull 会明确回
+// 「不支持的指令: pull」。这不是故障，是版本差 —— 认出来就该退化，
+// 而不是把整批更新判失败，让用户以为镜像或节点坏了。
+func errUnsupportedAction(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "不支持的指令")
+}
+
+// Op 返回节点当前正在进行的操作，没有则返回 nil。
+func (s *Server) Op(nodeID int64) *OpState { return s.Ops()[nodeID] }
+
+// OpResult 最近一次操作的阶段、说明与最后更新时间。
+//
+// 批量更新靠它判断「这一个成员跑完了没有、成没成」：只问 Busy 不够，
+// 完成态还会留 90 秒，紧接着下发下一个成员时会误把上一次的结果算到这一次头上，
+// 所以要把更新时间一起带出去，让调用方只认下发之后产生的那个结果。
+func (s *Server) OpResult(nodeID int64) (phase, message string, updatedAt time.Time) {
+	op := s.Op(nodeID)
+	if op == nil {
+		return "", "", time.Time{}
+	}
+	return op.Phase, op.Message, op.UpdatedAt
+}
+
+// Busy 这台机器此刻是否真的还在跑容器更新。
+//
+// 与 Op 分开写是因为语义不同：Op 是「最近一次操作长什么样」（完成态还会留 90 秒），
+// 而这里是「现在有没有在跑」，用来判断一张停在「更新中」的卡片是不是僵尸状态。
+func (s *Server) Busy(nodeID int64) bool {
+	op := s.Op(nodeID)
+	if op == nil {
+		return false
+	}
+	return op.Phase != hubproto.PhaseDone && op.Phase != hubproto.PhaseFailed
+}
+
+// Ops 返回所有节点当前的操作状态，顺手清掉已过期的。
+//
+// 过期判定分两档：完成态留 90 秒让页面至少读到一次结果；
+// 进行中态 5 分钟没有新消息就丢弃 —— Agent 崩了不会再有 event 帧，
+// 留着只会让页面永远停在「更新中」。
+func (s *Server) Ops() map[int64]*OpState {
+	s.opsMu.Lock()
+	defer s.opsMu.Unlock()
+	out := make(map[int64]*OpState, len(s.ops))
+	for id, op := range s.ops {
+		ttl := opRunningTTL
+		if op.Phase == hubproto.PhaseDone || op.Phase == hubproto.PhaseFailed {
+			ttl = opDoneTTL
+		}
+		if time.Since(op.UpdatedAt) > ttl {
+			delete(s.ops, id)
+			continue
+		}
+		cp := *op
+		out[id] = &cp
+	}
+	return out
+}
+
+// handleEvent 收到 Agent 的操作进度。
+func (s *Server) handleEvent(nodeID int64, name string, f hubproto.Frame) {
+	var ev hubproto.Event
+	if err := json.Unmarshal(f.Data, &ev); err != nil {
+		s.log.Debug("解析进度事件失败", "node", name, "err", err)
+		return
+	}
+	now := time.Now()
+
+	s.opsMu.Lock()
+	prev := s.ops[nodeID]
+	// 换了 OpID 就是新一次操作，重新计时；同一个 OpID 只更新状态。
+	if prev == nil || prev.OpID != ev.OpID {
+		prev = &OpState{OpID: ev.OpID, StartedAt: now}
+		s.ops[nodeID] = prev
+	}
+	prev.Kind = ev.Kind
+	prev.Phase = ev.Phase
+	prev.ContainerID = ev.ContainerID
+	prev.ContainerName = ev.ContainerName
+	prev.Message = ev.Message
+	if ev.TaskID > 0 {
+		prev.TaskID = ev.TaskID
+	}
+	prev.UpdatedAt = now
+	hubTask := prev.HubTaskID
+	s.opsMu.Unlock()
+
+	// 历史记录先落，再谈进度：任务行不存在的话，后面那些进度日志没有地方可写。
+	s.trackTask(nodeID, name, ev, hubTask)
+
+	switch ev.Phase {
+	case hubproto.PhaseDone:
+		s.log.Info("节点更新完成", "node", name, "container", ev.ContainerName)
+	case hubproto.PhaseFailed:
+		s.log.Warn("节点更新失败", "node", name, "container", ev.ContainerName, "err", ev.Message)
+	default:
+		s.log.Debug("节点进度", "node", name, "phase", ev.Phase, "msg", ev.Message)
+	}
+
+	// 卡片状态回写交给通知服务。放在后面：它不改变 Hub 自己的状态，
+	// 就算推送那边出问题，页面上的进度条也已经在上面更新过了。
+	if s.cfg.OnOp != nil {
+		s.cfg.OnOp(nodeID, ev)
+	}
+}
+
+// trackTask 维护 Hub 侧的远端更新任务记录。
+//
+// 只在 start 时建行，progress 追加日志，结束时落状态。Hub 不重试也不判断成败，
+// 结论完全照 Agent 报的那一帧写 —— 谁执行的谁负责判定。
+func (s *Server) trackTask(nodeID int64, nodeName string, ev hubproto.Event, taskID int64) int64 {
+	switch ev.Phase {
+	case hubproto.PhaseStart:
+		if taskID > 0 {
+			return taskID
+		}
+		name := ev.ContainerName
+		ref := ""
+		if c, err := s.st.FindNodeContainer(nodeID, ev.ContainerID); err == nil {
+			if name == "" {
+				name = c.ContainerName
+			}
+			ref = c.ImageRef
+		}
+		id, err := s.st.CreateTask(&model.Task{
+			ImageRef:      ref,
+			ContainerID:   ev.ContainerID,
+			ContainerName: name,
+			NodeID:        nodeID,
+			NodeName:      nodeName,
+			TriggeredBy:   "hub",
+		})
+		if err != nil {
+			s.log.Warn("创建远端任务记录失败", "node", nodeName, "err", err)
+			return 0
+		}
+		if err := s.st.StartTask(id, ""); err != nil {
+			s.log.Warn("标记远端任务开始失败", "task", id, "err", err)
+		}
+		s.opsMu.Lock()
+		if op := s.ops[nodeID]; op != nil && op.OpID == ev.OpID {
+			op.HubTaskID = id
+		}
+		s.opsMu.Unlock()
+		return id
+
+	case hubproto.PhaseProgress:
+		if taskID > 0 && ev.Message != "" {
+			line := "[" + time.Now().Format("15:04:05") + "] " + ev.Message
+			if err := s.st.AppendTaskLog(taskID, line); err != nil {
+				s.log.Debug("写入远端任务日志失败", "task", taskID, "err", err)
+			}
+		}
+
+	case hubproto.PhaseDone:
+		if taskID > 0 {
+			if err := s.st.FinishTask(taskID, model.TaskSuccess, "", ""); err != nil {
+				s.log.Warn("结束远端任务失败", "task", taskID, "err", err)
+			}
+		}
+
+	case hubproto.PhaseFailed:
+		if taskID > 0 {
+			if err := s.st.FinishTask(taskID, model.TaskFailed, "", ev.Message); err != nil {
+				s.log.Warn("结束远端任务失败", "task", taskID, "err", err)
+			}
+		}
+	}
+	return taskID
 }
 
 // HandleWS 处理 GET /api/agent/ws。
@@ -166,7 +551,7 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 		s.log.Warn("记录节点注册信息失败", "node", name, "err", err)
 	}
 
-	c := &conn{nodeID: node.ID, ws: ws, done: make(chan struct{})}
+	c := &conn{nodeID: node.ID, ws: ws, done: make(chan struct{}), pending: map[string]chan hubproto.Frame{}}
 	s.register(c)
 	defer s.unregister(c)
 
@@ -181,6 +566,13 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Info("节点已上线", "node", name, "node_id", node.ID,
 		"hostname", h.Hostname, "os", h.OS, "agent", h.AgentVersion)
+
+	// 上一次升级过来确认结果：Agent 起来后第一件事就是连进来，
+	// 版本对上了就是成功，比等它跑完首轮巡检再说话要快得多。
+	s.confirmUpgrade(node.ID, name, h.AgentVersion)
+	// 版本落后的节点由 Hub 自动推一份升级下去。放在协程里：它要先等几秒
+	// 让首轮巡检跑完，不能挡住读循环。
+	go s.maybeAutoUpgrade(node.ID, name, h.AgentVersion)
 
 	// 心跳独立成协程：读循环被 report 卡住时（网络慢、包大），
 	// 心跳不能跟着停 —— 否则节点会被误判离线。
@@ -211,10 +603,13 @@ func (s *Server) readLoop(c *conn, name string) {
 			_ = s.st.TouchNode(c.nodeID)
 		case hubproto.TypeReport:
 			s.handleReport(c.nodeID, name, f)
+		case hubproto.TypeEvent:
+			s.handleEvent(c.nodeID, name, f)
 		case hubproto.TypeCmdAck:
 			if !f.OK {
 				s.log.Warn("节点指令执行失败", "node", name, "id", f.ID, "err", f.Error)
 			}
+			c.deliverAck(f)
 		}
 	}
 }
@@ -229,6 +624,13 @@ func (s *Server) handleReport(nodeID int64, name string, f hubproto.Frame) {
 		s.log.Warn("刷新节点心跳失败", "node", name, "err", err)
 	}
 
+	// 升级结局随升级后的第一份上报一起回来，收下它等于把这次升级结案。
+	// 放在这里而不是放在后面：下面有一条「巡检失败就保留旧快照」的提前返回，
+	// 那条路同样可能带着升级结果。
+	if rep.Upgrade != nil {
+		s.noteUpgradeResult(nodeID, name, rep.Upgrade)
+	}
+
 	// 巡检本身失败且没有任何数据时，保留上一轮快照。
 	// 否则一次 Docker 抖动就会把页面上整台机器的容器清空，像是全被删了。
 	if rep.ScanError != "" && len(rep.Containers) == 0 {
@@ -239,22 +641,25 @@ func (s *Server) handleReport(nodeID int64, name string, f hubproto.Frame) {
 	list := make([]model.NodeContainer, 0, len(rep.Containers))
 	for _, c := range rep.Containers {
 		list = append(list, model.NodeContainer{
-			NodeID:        nodeID,
-			ContainerID:   c.ContainerID,
-			ContainerName: c.ContainerName,
-			ImageRef:      c.ImageRef,
-			ImageID:       c.ImageID,
-			LocalTag:      c.LocalTag,
-			LocalDigest:   c.LocalDigest,
-			RemoteDigest:  c.RemoteDigest,
-			LatestTag:     c.LatestTag,
-			Aliases:       c.Aliases,
-			Origin:        model.ImageOrigin(c.Origin),
-			Status:        model.Status(c.Status),
-			Mode:          model.DetectMode(c.Mode),
-			Ignored:       c.Ignored,
-			LastError:     c.LastError,
-			CheckedAt:     tsToTime(c.CheckedAt),
+			NodeID:         nodeID,
+			ContainerID:    c.ContainerID,
+			ContainerName:  c.ContainerName,
+			ComposeProject: c.ComposeProject,
+			ComposeService: c.ComposeService,
+			ComposeDeps:    c.ComposeDeps,
+			ImageRef:       c.ImageRef,
+			ImageID:        c.ImageID,
+			LocalTag:       c.LocalTag,
+			LocalDigest:    c.LocalDigest,
+			RemoteDigest:   c.RemoteDigest,
+			LatestTag:      c.LatestTag,
+			Aliases:        c.Aliases,
+			Origin:         model.ImageOrigin(c.Origin),
+			Status:         model.Status(c.Status),
+			Mode:           model.DetectMode(c.Mode),
+			Ignored:        c.Ignored,
+			LastError:      c.LastError,
+			CheckedAt:      tsToTime(c.CheckedAt),
 		})
 	}
 	if err := s.st.ReplaceNodeContainers(nodeID, list); err != nil {
@@ -265,6 +670,10 @@ func (s *Server) handleReport(nodeID int64, name string, f hubproto.Frame) {
 		s.log.Warn("记录节点上报时间失败", "node", name, "err", err)
 	}
 	s.log.Debug("收到节点上报", "node", name, "count", len(list))
+
+	// 快照存好之后再推提醒：通知里的容器名、镜像引用都来自这份数据，
+	// 反过来的话用户可能收到一条指向「还不存在的容器」的提醒。
+	s.notifyUpdates(nodeID, name, list)
 }
 
 func (s *Server) heartbeat(c *conn) {
@@ -323,6 +732,33 @@ func (c *conn) close() {
 		close(c.done)
 		_ = c.ws.Close()
 	})
+}
+
+func (c *conn) addPending(id string, ch chan hubproto.Frame) {
+	c.pendingMu.Lock()
+	c.pending[id] = ch
+	c.pendingMu.Unlock()
+}
+
+func (c *conn) dropPending(id string) {
+	c.pendingMu.Lock()
+	delete(c.pending, id)
+	c.pendingMu.Unlock()
+}
+
+// deliverAck 把回执交给正在等待的那一方。没人等就直接丢弃 ——
+// Send 下发的指令本来就不带回执需求，读循环仍需照常消费这些帧。
+func (c *conn) deliverAck(f hubproto.Frame) {
+	c.pendingMu.Lock()
+	ch := c.pending[f.ID]
+	c.pendingMu.Unlock()
+	if ch == nil {
+		return
+	}
+	select {
+	case ch <- f:
+	default:
+	}
 }
 
 func bearerToken(r *http.Request) string {

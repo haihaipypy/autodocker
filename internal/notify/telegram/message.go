@@ -133,9 +133,16 @@ func BuildUpdateMessage(n *model.Notification) Message {
 		"",
 		rich(n.Body),
 		"",
+	}
+	// 节点放在容器前面并单独一行：手机上几条提醒连着弹，第一眼要能看出
+	// 这条说的是哪台机器 —— 本机提醒没有这一行。
+	if n.NodeName != "" {
+		lines = append(lines, fmt.Sprintf("🖥️ 节点：<b>%s</b>", esc(n.NodeName)))
+	}
+	lines = append(lines,
 		fmt.Sprintf("📦 容器：<code>%s</code>", esc(name)),
 		fmt.Sprintf("🏷 镜像：<code>%s</code>", esc(n.ImageRef)),
-	}
+	)
 	if n.Kind == model.NotifNewTag && n.LatestTag != "" {
 		lines = append(lines,
 			fmt.Sprintf("当前版本：<code>%s</code>", esc(orDash(n.LocalTag))),
@@ -194,9 +201,14 @@ func BuildStateMessage(n *model.Notification, state model.CardState, detail stri
 		"",
 		rich(detail),
 		"",
+	}
+	if n.NodeName != "" {
+		lines = append(lines, fmt.Sprintf("🖥️ 节点：<b>%s</b>", esc(n.NodeName)))
+	}
+	lines = append(lines,
 		fmt.Sprintf("📦 容器：<code>%s</code>", esc(name)),
 		fmt.Sprintf("🏷 镜像：<code>%s</code>", esc(n.ImageRef)),
-	}
+	)
 
 	m := Message{Text: strings.Join(lines, "\n")}
 	// 失败与回滚留一个「重试更新」，省得用户回后台页面点

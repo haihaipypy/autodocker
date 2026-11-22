@@ -14,7 +14,8 @@ import (
 // ErrNotFound 记录不存在。
 var ErrNotFound = errors.New("记录不存在")
 
-const imageCols = `id, reference, container_id, container_name, origin, image_id, size_bytes,
+const imageCols = `id, reference, container_id, container_name, compose_project, compose_service, compose_deps,
+	origin, image_id, size_bytes,
 	image_created, dangling, local_digest, remote_digest,
 	local_tag, latest_tag, aliases, mode, mode_override, ignored, ignored_digest, status,
 	notified_tag, notified_digest,
@@ -28,6 +29,7 @@ func scanImage(sc rowScanner) (model.Image, error) {
 	var (
 		img                   model.Image
 		aliasesJSON           string
+		depsJSON              string
 		modeOverride, ignored int
 		dangling              int
 		baselineAt            int64
@@ -35,7 +37,8 @@ func scanImage(sc rowScanner) (model.Image, error) {
 		createdAt, updatedAt  int64
 	)
 	err := sc.Scan(
-		&img.ID, &img.Reference, &img.ContainerID, &img.ContainerName,
+		&img.ID, &img.Reference, &img.ContainerID, &img.ContainerName, &img.ComposeProject,
+		&img.ComposeService, &depsJSON,
 		&img.Origin, &img.ImageID, &img.SizeBytes, &img.ImageCreated, &dangling,
 		&img.LocalDigest, &img.RemoteDigest, &img.LocalTag, &img.LatestTag,
 		&aliasesJSON, &img.Mode, &modeOverride, &ignored, &img.IgnoredDigest, &img.Status,
@@ -54,6 +57,9 @@ func scanImage(sc rowScanner) (model.Image, error) {
 	img.UpdatedAt = tsToTime(updatedAt)
 	if aliasesJSON != "" {
 		_ = json.Unmarshal([]byte(aliasesJSON), &img.Aliases)
+	}
+	if depsJSON != "" {
+		_ = json.Unmarshal([]byte(depsJSON), &img.ComposeDeps)
 	}
 	if img.Origin == "" {
 		// 理论上迁移已经回填过，这里再兜一层，避免旧数据把归属判断漏掉。
@@ -93,18 +99,26 @@ func (s *Store) UpsertImage(img *model.Image) (int64, error) {
 	if err != nil {
 		aliases = []byte("[]")
 	}
+	deps, err := json.Marshal(img.ComposeDeps)
+	if err != nil {
+		deps = []byte("[]")
+	}
 
 	var id int64
 	err = s.db.QueryRow(`
 		INSERT INTO images(
-			reference, container_id, container_name, origin, image_id, size_bytes,
+			reference, container_id, container_name, compose_project, compose_service, compose_deps,
+			origin, image_id, size_bytes,
 			image_created, dangling, local_digest, remote_digest,
 			local_tag, latest_tag, aliases, mode, mode_override, ignored, ignored_digest, status,
 			notified_tag, notified_digest,
 			baseline_at, last_checked_at, last_error, created_at, updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(reference, container_id) DO UPDATE SET
 			container_name  = excluded.container_name,
+			compose_project = excluded.compose_project,
+			compose_service = excluded.compose_service,
+			compose_deps    = excluded.compose_deps,
 			origin          = excluded.origin,
 			image_id        = excluded.image_id,
 			size_bytes      = excluded.size_bytes,
@@ -118,7 +132,8 @@ func (s *Store) UpsertImage(img *model.Image) (int64, error) {
 			updated_at      = excluded.updated_at,
 			mode            = CASE WHEN images.mode_override = 1 THEN images.mode ELSE excluded.mode END
 		RETURNING id`,
-		img.Reference, img.ContainerID, img.ContainerName, string(img.Origin), img.ImageID,
+		img.Reference, img.ContainerID, img.ContainerName, img.ComposeProject, img.ComposeService, string(deps),
+		string(img.Origin), img.ImageID,
 		img.SizeBytes, img.ImageCreated, b2i(img.Dangling), img.LocalDigest, img.RemoteDigest,
 		img.LocalTag, img.LatestTag, string(aliases), img.Mode, b2i(img.ModeOverride), b2i(img.Ignored),
 		img.IgnoredDigest, img.Status,
@@ -189,6 +204,28 @@ func (s *Store) FindImageByContainer(containerID string) (*model.Image, error) {
 	img, err := scanImage(s.db.QueryRow(
 		`SELECT `+imageCols+` FROM images WHERE container_id = ? ORDER BY id DESC LIMIT 1`,
 		containerID,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &img, nil
+}
+
+// FindImageByContainerName 按容器名找监控项。
+//
+// 编号失效（容器被重建过）时的兜底：容器名在重建时是刻意保留的，
+// 用户和 Agent 都靠它认这个容器。只认编号的话，一次 compose 重建
+// 就会让「更新」变成永远拉一个空引用。
+func (s *Store) FindImageByContainerName(name string) (*model.Image, error) {
+	if name == "" {
+		return nil, ErrNotFound
+	}
+	img, err := scanImage(s.db.QueryRow(
+		`SELECT `+imageCols+` FROM images WHERE container_name = ? ORDER BY id DESC LIMIT 1`,
+		name,
 	))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound

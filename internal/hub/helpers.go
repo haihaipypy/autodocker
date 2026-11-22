@@ -12,6 +12,14 @@ import (
 // osHostname 单独包一层，便于测试时替换。
 func osHostname() (string, error) { return os.Hostname() }
 
+// shortID 截短容器编号用于展示。取 12 位是 Docker 自己的惯例。
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
+
 // osName 取目标机的系统名。
 //
 // 走的是守护进程的 /info，而不是容器里的 /etc/os-release —— 后者读到的是

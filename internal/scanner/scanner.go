@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,12 +15,60 @@ import (
 	"github.com/haihaipypy/autodocker/internal/dockerx"
 	"github.com/haihaipypy/autodocker/internal/model"
 	"github.com/haihaipypy/autodocker/internal/registry"
+	"github.com/haihaipypy/autodocker/internal/selfupgrade"
 	"github.com/haihaipypy/autodocker/internal/store"
 	"github.com/haihaipypy/autodocker/internal/version"
 )
 
 // ErrScanRunning 已有扫描在执行。
 var ErrScanRunning = errors.New("已有扫描正在执行")
+
+// composeProjectLabel 是 compose 打在容器上的项目名标签。
+//
+// 合并提醒的唯一可靠依据：靠容器名前缀猜（safeline-chaos → safeline）在
+// 自定义了 container_name 或项目名时立刻失效，而标签是 compose 自己写的。
+const composeProjectLabel = "com.docker.compose.project"
+
+// composeServiceLabel / composeDependsLabel 是 compose 打在容器上的
+// 「服务名」与「依赖谁」两个标签。
+//
+// depends_on 的值长这样：
+//
+//	safeline-pg:service_started:false,safeline-mgt:service_healthy:true
+//
+// 每一项是 服务名:启动条件:是否必须。**里面写的是服务名，不是容器名** ——
+// 容器名还带着项目前缀和 -1 序号，直接拿容器名去比对会一个都对不上，
+// 所以这两个标签必须一起取。
+const (
+	composeServiceLabel = "com.docker.compose.service"
+	composeDependsLabel = "com.docker.compose.depends_on"
+)
+
+// parseComposeDeps 把 depends_on 标签拆成服务名列表。
+//
+// 只保留服务名：启动条件（service_started / service_healthy）与「是否必须」
+// 我们不用 —— 重建是自己停自己起，条件由重建后的等待健康检查来保证。
+// 顺序与去重就地做掉，脏值（空项、只有一个冒号的残缺项）直接丢弃。
+func parseComposeDeps(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	seen := make(map[string]bool, 4)
+	for _, item := range strings.Split(raw, ",") {
+		name := item
+		if i := strings.IndexByte(item, ':'); i >= 0 {
+			name = item[:i]
+		}
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out
+}
 
 // Notifier 通知发送能力的抽象，避免 scanner 依赖具体通知实现。
 type Notifier interface {
@@ -129,6 +178,11 @@ func (s *Scanner) Scan(ctx context.Context, force bool) (*model.Scan, error) {
 
 	live := make([]string, 0, len(containers))
 	targets := make([]dockerx.Container, 0, len(containers))
+	// 排除名单里「自身」相关的名字必须按实际容器名来拼，不能只信配置。
+	// 配置默认是 autodocker，而 Agent 装出来叫 autodocker-agent —— 拼出来的
+	// autodocker-old 永远对不上列表里的 autodocker-agent-old，那个「改名待删」
+	// 的旧容器就被当成用户的容器上报，还带着「可选更新」。
+	opt = withSelfExcludes(opt, containers)
 	for _, c := range containers {
 		if s.skip(c, opt) {
 			continue
@@ -146,7 +200,7 @@ func (s *Scanner) Scan(ctx context.Context, force bool) (*model.Scan, error) {
 		sem        = make(chan struct{}, opt.Concurrency)
 		total      int
 		withUpdate int
-		notified   int
+		hits       []updateHit
 	)
 	for _, c := range targets {
 		wg.Add(1)
@@ -154,19 +208,23 @@ func (s *Scanner) Scan(ctx context.Context, force bool) (*model.Scan, error) {
 		go func(c dockerx.Container) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			r := s.checkContainer(ctx, c, force)
+			r, hit := s.checkContainer(ctx, c, force)
 			mu.Lock()
 			total++
 			if r.HasUpdate {
 				withUpdate++
 			}
-			if r.Notified {
-				notified++
+			if hit != nil {
+				hits = append(hits, *hit)
 			}
 			mu.Unlock()
 		}(c)
 	}
 	wg.Wait()
+
+	// 通知必须在整轮容器扫完之后再发：同一 compose 项目里的服务是一起发版的，
+	// 边扫边发就是一次弹 6 条消息。收集起来按项目合并，一个项目只发一条。
+	notified := s.notifyHits(ctx, hits, force)
 
 	// 镜像维度：本机存在但没有任何容器在用的镜像，加上 WATCH 的纯远端项。
 	// 这一步必须放在容器之后 —— 判断「某个镜像有没有被使用」要靠容器列表。
@@ -192,6 +250,27 @@ func (s *Scanner) Scan(ctx context.Context, force bool) (*model.Scan, error) {
 	s.log.Info("巡检完成", "total", total, "updates", withUpdate)
 	sc, _ := s.st.GetScanByID(scanID)
 	return sc, nil
+}
+
+// withSelfExcludes 按容器列表里**实际**的自身名字，补上自升级过程出现的两个名字。
+//
+// 为什么不能只靠 Options 里的配置：SelfContainer 的默认值是 autodocker（历史原因，
+// 那时只有 Hub 一种形态），而 Agent 的安装命令把容器名写死成 autodocker-agent。
+// 少了这一步，排除名单里躺着的是 autodocker-old，而页面上冒出来的是
+// autodocker-agent-old —— 两者对不上，那个容器就一直挂在节点列表里。
+//
+// 认自身优先按 ID（容器里的 hostname 就是短 ID，最可靠），其次按名字。
+func withSelfExcludes(opt Options, list []dockerx.Container) Options {
+	for _, c := range list {
+		if c.Name != opt.SelfContainer &&
+			(opt.SelfContainerID == "" || !strings.HasPrefix(c.ID, opt.SelfContainerID)) {
+			continue
+		}
+		extra := selfupgrade.AuxContainers(c.Name)
+		opt.ExcludeContainers = append(append([]string{}, opt.ExcludeContainers...), extra...)
+		return opt
+	}
+	return opt
 }
 
 // skip 判断容器是否应排除在监控之外。
@@ -221,18 +300,31 @@ func (s *Scanner) skip(c dockerx.Container, opt Options) bool {
 }
 
 // checkContainer 检测单个本地容器。
-func (s *Scanner) checkContainer(ctx context.Context, c dockerx.Container, force bool) Result {
+func (s *Scanner) checkContainer(ctx context.Context, c dockerx.Container, force bool) (Result, *updateHit) {
 	ref, err := registry.ParseReference(c.Image)
 	if err != nil {
 		s.log.Warn("无法解析镜像引用", "image", c.Image, "err", err)
-		return Result{Skipped: true}
+		return Result{Skipped: true}, nil
 	}
 
 	existing, findErr := s.st.FindImage(c.Image, c.ID)
+
+	// 本地摘要必须和 upsert 一起落库。
+	//
+	// 只在后面的判定里用、却忘了存的表现很隐蔽：本机页面看不出问题（通知是拿
+	// 内存里的值拼的），但远端节点把库里的记录整份上报给 Hub，那一栏就是空的 ——
+	// 卡片上写着「本地摘要：未知」，用户没法确认到底是哪一份镜像落后了。
+	localDigest := ""
+	if _, d, derr := s.dk.DigestForImage(ctx, c.ImageID, c.Image); derr == nil {
+		localDigest = d
+	} else {
+		s.log.Warn("读取本地镜像摘要失败", "image", c.Image, "err", derr)
+	}
+
 	if findErr == nil && existing.Ignored {
 		// 已忽略：只刷新本地观测值，不做远端查询
-		s.upsertImage(existing, c, ref, model.StatusIgnored)
-		return Result{Skipped: true}
+		s.upsertImage(existing, c, ref, model.StatusIgnored, localDigest)
+		return Result{Skipped: true}, nil
 	}
 
 	mode := model.ModeAuto
@@ -244,20 +336,12 @@ func (s *Scanner) checkContainer(ctx context.Context, c dockerx.Container, force
 	// 之后即使把容器换成 nginx:1.25，也再不会进入版本监听。
 	effective := resolveMode(mode, ref.Tag)
 
-	localDigest := ""
-	if _, d, derr := s.dk.DigestForImage(ctx, c.ImageID, c.Image); derr == nil {
-		localDigest = d
-	} else {
-		s.log.Warn("读取本地镜像摘要失败", "image", c.Image, "err", derr)
-	}
-
 	remoteDigest, rerr := s.reg.ManifestDigest(ctx, ref)
 	if rerr != nil {
-		img := s.upsertImage(existing, c, ref, model.StatusUnknown)
+		img := s.upsertImage(existing, c, ref, model.StatusUnknown, localDigest)
 		img.Mode = mode
-		img.LocalDigest = localDigest
 		_ = s.st.UpdateImageCheck(img.ID, model.StatusUnknown, "", "", nil, mode, rerr.Error())
-		return Result{Skipped: true}
+		return Result{Skipped: true}, nil
 	}
 
 	status := model.StatusUpToDate
@@ -278,9 +362,8 @@ func (s *Scanner) checkContainer(ctx context.Context, c dockerx.Container, force
 		kind = model.NotifNewTag
 	}
 
-	img := s.upsertImage(existing, c, ref, status)
+	img := s.upsertImage(existing, c, ref, status, localDigest)
 	img.Mode = mode
-	img.LocalDigest = localDigest
 	img.RemoteDigest = remoteDigest
 	img.LatestTag = latestTag
 	img.Aliases = aliases
@@ -289,11 +372,11 @@ func (s *Scanner) checkContainer(ctx context.Context, c dockerx.Container, force
 	}
 
 	if status != model.StatusUpdatePending && status != model.StatusNewTag {
-		return Result{}
+		return Result{}, nil
 	}
 
-	notified := s.notify(ctx, img, kind, force)
-	return Result{HasUpdate: true, Notified: notified}
+	// 不在这里发通知：先攒着，整轮扫完后按 compose 项目合并成一条。
+	return Result{HasUpdate: true}, &updateHit{img: img, kind: kind}
 }
 
 // imageTarget 一个镜像维度的监控目标：本机镜像，或仅在远端盯梢的引用。
@@ -524,7 +607,7 @@ func (s *Scanner) checkImageTarget(ctx context.Context, t imageTarget, force boo
 	if status == model.StatusNewTag {
 		kind = model.NotifNewTag
 	}
-	notified := s.notify(ctx, img, kind, force)
+	notified := s.notifyOne(ctx, img, kind, force)
 	return Result{HasUpdate: true, Notified: notified}
 }
 
@@ -550,16 +633,23 @@ func (s *Scanner) findNewerTags(ctx context.Context, ref registry.Reference) (la
 }
 
 // upsertImage 把容器观测值落库（保留用户侧设定与基线）。
-func (s *Scanner) upsertImage(existing *model.Image, c dockerx.Container, ref registry.Reference, status model.Status) *model.Image {
+//
+// localDigest 必须在这里写进去：UpsertImage 的冲突分支会用新值覆盖 local_digest，
+// 传空就等于每轮巡检都把这一列抹一遍。
+func (s *Scanner) upsertImage(existing *model.Image, c dockerx.Container, ref registry.Reference, status model.Status, localDigest string) *model.Image {
 	img := &model.Image{
-		Reference:     c.Image,
-		ContainerID:   c.ID,
-		ContainerName: c.Name,
-		Origin:        model.OriginContainer,
-		ImageID:       c.ImageID,
-		LocalTag:      ref.Tag,
-		Status:        status,
-		Mode:          model.ModeAuto,
+		Reference:      c.Image,
+		ContainerID:    c.ID,
+		ContainerName:  c.Name,
+		ComposeProject: c.Labels[composeProjectLabel],
+		ComposeService: c.Labels[composeServiceLabel],
+		ComposeDeps:    parseComposeDeps(c.Labels[composeDependsLabel]),
+		Origin:         model.OriginContainer,
+		ImageID:        c.ImageID,
+		LocalTag:       ref.Tag,
+		LocalDigest:    localDigest,
+		Status:         status,
+		Mode:           model.ModeAuto,
 	}
 	if existing != nil {
 		img.ID = existing.ID
@@ -584,57 +674,137 @@ func (s *Scanner) upsertImage(existing *model.Image, c dockerx.Container, ref re
 	return img
 }
 
-// notify 去重后生成并推送通知，返回是否真的推送了。
-func (s *Scanner) notify(ctx context.Context, img *model.Image, kind model.NotificationKind, force bool) bool {
-	if !force {
-		// 同一条监控项已有待处理的通知时不再重复打扰
-		if _, err := s.st.FindPendingNotification(img.Reference, img.ContainerID); err == nil {
+// updateHit 这一轮巡检里「该提醒」的一个容器。
+//
+// 不在 checkContainer 里直接发通知：同一 compose 项目的服务是一起发版的，
+// 边扫边发就是一次弹 6 条消息。先攒着，整轮扫完按项目合并。
+type updateHit struct {
+	img  *model.Image
+	kind model.NotificationKind
+}
+
+// shouldNotify 这一版是不是该提醒（去重）。
+func (s *Scanner) shouldNotify(img *model.Image, kind model.NotificationKind, force bool) bool {
+	if force {
+		return true
+	}
+	// 同一条监控项已有待处理的通知时不再重复打扰
+	if _, err := s.st.FindPendingNotification(img.Reference, img.ContainerID); err == nil {
+		return false
+	}
+	// 这一版已经提醒过，或者用户点过「忽略本版本」。
+	//
+	// 判断依据记在**监控项**上，不是通知记录里：用户清掉已读历史之后那条
+	// 记录就没了，还照它判断等于「删一条通知就让同一版本重新冒出来」——
+	// 这正是「忽略或移除的提醒总是又出现」的根因。
+	//
+	// HasNotificationForTag 留着兜底，覆盖升级前的老数据：那时还没有
+	// notified_tag，历史记录是唯一的依据。
+	if kind == model.NotifNewTag && img.LatestTag != "" {
+		if img.NotifiedTag != "" && version.SameVersion(img.NotifiedTag, img.LatestTag) {
 			return false
 		}
-		// 这一版已经提醒过，或者用户点过「忽略本版本」。
-		//
-		// 判断依据记在**监控项**上，不是通知记录里：用户清掉已读历史之后那条
-		// 记录就没了，还照它判断等于「删一条通知就让同一版本重新冒出来」——
-		// 这正是「忽略或移除的提醒总是又出现」的根因。
-		//
-		// HasNotificationForTag 留着兜底，覆盖升级前的老数据：那时还没有
-		// notified_tag，历史记录是唯一的依据。
-		if kind == model.NotifNewTag && img.LatestTag != "" {
-			if img.NotifiedTag != "" && version.SameVersion(img.NotifiedTag, img.LatestTag) {
-				return false
-			}
-			if ok, err := s.st.HasNotificationForTag(img.Reference, img.ContainerID, img.LatestTag); err == nil && ok {
-				return false
-			}
-		}
-		// 用户在卡片上点过「忽略本版本」：只要远端内容没再变，就别反复提醒。
-		//
-		// 这里必须比**远端摘要**而不是 tag：浮动 tag 场景下 tag 永远不变，
-		// 能区分「还是那一版」和「作者又推了新一版」的只有摘要。
-		// new_tag 不需要这一步 —— 上面按 tag 比过了。
-		if kind == model.NotifNewVersion && img.RemoteDigest != "" &&
-			(img.NotifiedDigest == img.RemoteDigest || img.IgnoredDigest == img.RemoteDigest) {
+		if ok, err := s.st.HasNotificationForTag(img.Reference, img.ContainerID, img.LatestTag); err == nil && ok {
 			return false
 		}
 	}
+	// 用户在卡片上点过「忽略本版本」：只要远端内容没再变，就别反复提醒。
+	//
+	// 这里必须比**远端摘要**而不是 tag：浮动 tag 场景下 tag 永远不变，
+	// 能区分「还是那一版」和「作者又推了新一版」的只有摘要。
+	// new_tag 不需要这一步 —— 上面按 tag 比过了。
+	if kind == model.NotifNewVersion && img.RemoteDigest != "" &&
+		(img.NotifiedDigest == img.RemoteDigest || img.IgnoredDigest == img.RemoteDigest) {
+		return false
+	}
+	return true
+}
 
+// notifyHits 去重、按 compose 项目合并后落库并推送，返回提醒覆盖的容器数。
+func (s *Scanner) notifyHits(ctx context.Context, hits []updateHit, force bool) int {
+	ready := make([]updateHit, 0, len(hits))
+	for _, h := range hits {
+		if s.shouldNotify(h.img, h.kind, force) {
+			ready = append(ready, h)
+		}
+	}
+	count := 0
+	for _, group := range groupHits(ready) {
+		if s.notifyGroup(ctx, group) {
+			count += len(group)
+		}
+	}
+	return count
+}
+
+// notifyOne 单条提醒（镜像维度那种没有 compose 项目的项）。
+func (s *Scanner) notifyOne(ctx context.Context, img *model.Image, kind model.NotificationKind, force bool) bool {
+	return s.notifyHits(ctx, []updateHit{{img: img, kind: kind}}, force) > 0
+}
+
+// groupHits 按 compose 项目分组，没有项目标签的容器各自一组。
+//
+// 顺序按第一次出现的容器来，不排序：用户看提醒时对照的就是扫描顺序，
+// 突然按字母重排反而对不上自己在页面上看到的那一列。
+func groupHits(hits []updateHit) [][]updateHit {
+	idx := map[string]int{}
+	var out [][]updateHit
+	for _, h := range hits {
+		key := h.img.ComposeProject
+		if key == "" {
+			// 没有项目标签：容器编号唯一；纯远端盯梢项没有容器，用记录 ID 兜底。
+			key = "#" + h.img.ContainerID
+			if h.img.ContainerID == "" {
+				key = "#img:" + strconv.FormatInt(h.img.ID, 10)
+			}
+		}
+		if i, ok := idx[key]; ok {
+			out[i] = append(out[i], h)
+			continue
+		}
+		idx[key] = len(out)
+		out = append(out, []updateHit{h})
+	}
+	return out
+}
+
+// notifyGroup 把一组（同一 compose 项目）更新项写成一条提醒并推送。
+func (s *Scanner) notifyGroup(ctx context.Context, group []updateHit) bool {
+	if len(group) == 0 {
+		return false
+	}
+	first := group[0].img
 	n := &model.Notification{
-		ImageRef:      img.Reference,
-		ContainerID:   img.ContainerID,
-		ContainerName: img.ContainerName,
-		Kind:          kind,
-		LocalSummary:  version.ShortDigest(img.LocalDigest),
-		RemoteSummary: version.ShortDigest(img.RemoteDigest),
-		LocalTag:      img.LocalTag,
-		LatestTag:     img.LatestTag,
-		Aliases:       img.Aliases,
-		CardState:     model.CardPending,
+		ImageRef:       first.Reference,
+		ContainerID:    first.ContainerID,
+		ContainerName:  first.ContainerName,
+		Kind:           group[0].kind,
+		ComposeProject: first.ComposeProject,
+		LocalSummary:   version.ShortDigest(first.LocalDigest),
+		RemoteSummary:  version.ShortDigest(first.RemoteDigest),
+		LocalTag:       first.LocalTag,
+		LatestTag:      first.LatestTag,
+		Aliases:        first.Aliases,
+		CardState:      model.CardPending,
 	}
-	n.Title, n.Body = buildText(img, kind)
+	members := make([]model.NotificationMember, 0, len(group))
+	for _, h := range group {
+		members = append(members, model.NotificationMember{
+			ContainerID:   h.img.ContainerID,
+			ContainerName: h.img.ContainerName,
+			ImageRef:      h.img.Reference,
+			Kind:          h.kind,
+			LocalTag:      h.img.LocalTag,
+			LatestTag:     h.img.LatestTag,
+			LocalSummary:  version.ShortDigest(h.img.LocalDigest),
+			RemoteSummary: version.ShortDigest(h.img.RemoteDigest),
+		})
+	}
+	n.Title, n.Body = buildGroupText(group)
 
-	id, err := s.st.CreateNotification(n)
+	id, err := s.st.CreateNotificationWithMembers(n, members)
 	if err != nil {
-		s.log.Warn("写入通知失败", "err", err)
+		s.log.Warn("写入通知失败", "project", first.ComposeProject, "ref", first.Reference, "err", err)
 		return false
 	}
 	n.ID = id
@@ -644,10 +814,12 @@ func (s *Scanner) notify(ctx context.Context, img *model.Image, kind model.Notif
 	//
 	// 两个标记分开写：new_tag 场景的 RemoteDigest 是**旧 tag** 的摘要，
 	// 拿它当「已提醒的摘要」会在下一轮把新版本当成「提醒过了」而漏掉。
-	if kind == model.NotifNewTag {
-		_ = s.st.SetImageNotified(img.ID, img.LatestTag, "")
-	} else if img.RemoteDigest != "" {
-		_ = s.st.SetImageNotified(img.ID, "", img.RemoteDigest)
+	for _, h := range group {
+		if h.kind == model.NotifNewTag {
+			_ = s.st.SetImageNotified(h.img.ID, h.img.LatestTag, "")
+		} else if h.img.RemoteDigest != "" {
+			_ = s.st.SetImageNotified(h.img.ID, "", h.img.RemoteDigest)
+		}
 	}
 
 	s.mu.Lock()
@@ -661,7 +833,7 @@ func (s *Scanner) notify(ctx context.Context, img *model.Image, kind model.Notif
 	defer cancel()
 	msgID, nerr := notifier.Notify(pushCtx, n)
 	if nerr != nil {
-		s.log.Warn("推送通知失败", "ref", img.Reference, "err", nerr)
+		s.log.Warn("推送通知失败", "ref", first.Reference, "err", nerr)
 		return true
 	}
 	if msgID != "" || len(n.Deliveries) > 0 {
@@ -670,6 +842,45 @@ func (s *Scanner) notify(ctx context.Context, img *model.Image, kind model.Notif
 		_ = s.st.SetNotificationDeliveries(id, n.Deliveries, model.CardPending)
 	}
 	return true
+}
+
+// buildGroupText 合并提醒的标题与正文。
+//
+// 标题必须一眼能看出「这是整个项目，不是某一个容器」：手机锁屏上只看得到
+// 第一行，写「safeline-chaos 有新版本」会让用户以为只有那一个要更新。
+func buildGroupText(group []updateHit) (title, body string) {
+	first := group[0].img
+	if len(group) == 1 {
+		return buildText(first, group[0].kind)
+	}
+	project := first.ComposeProject
+	if project == "" {
+		project = "同一批容器"
+	}
+	title = fmt.Sprintf("%s（%d 个容器）有新版本可用", project, len(group))
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "compose 项目 **%s** 有 %d 个容器可更新：", project, len(group))
+	limit := len(group)
+	if limit > 12 {
+		limit = 12
+	}
+	for _, h := range group[:limit] {
+		name := h.img.ContainerName
+		if name == "" {
+			name = h.img.Reference
+		}
+		if h.kind == model.NotifNewTag && h.img.LatestTag != "" {
+			fmt.Fprintf(&b, "\n• %s  %s → **%s**", name, h.img.LocalTag, h.img.LatestTag)
+		} else {
+			fmt.Fprintf(&b, "\n• %s  %s（内容已更新）", name, h.img.LocalTag)
+		}
+	}
+	if len(group) > limit {
+		fmt.Fprintf(&b, "\n…另有 %d 个", len(group)-limit)
+	}
+	b.WriteString("\n\n点「立即更新」会依次重建这些容器，一次一个；某个失败会停下并说明原因。")
+	return title, b.String()
 }
 
 // buildText 生成通知标题与正文。

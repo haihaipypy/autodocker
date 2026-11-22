@@ -110,10 +110,16 @@ func BuildUpdateCard(n *model.Notification) map[string]any {
 		name = "（无关联容器）"
 	}
 
-	lines := []string{
+	var lines []string
+	// 远端提醒先亮出节点名并染上颜色：卡片标题里的名字字号小，
+	// 连收几条时容易看串行，正文里再给一行橙色的才够醒目。
+	if n.NodeName != "" {
+		lines = append(lines, "**节点**："+nodeColor(n.NodeName))
+	}
+	lines = append(lines,
 		fmt.Sprintf("**容器**：%s", name),
 		fmt.Sprintf("**镜像**：%s", n.ImageRef),
-	}
+	)
 	if n.Kind == model.NotifNewTag && n.LatestTag != "" {
 		lines = append(lines,
 			fmt.Sprintf("**当前版本**：%s", orDash(n.LocalTag)),
@@ -171,10 +177,15 @@ func BuildStateCard(n *model.Notification, state model.CardState, detail string)
 		name = n.ImageRef
 	}
 
+	info := fmt.Sprintf("**容器**：%s\n**镜像**：%s", name, n.ImageRef)
+	if n.NodeName != "" {
+		info = "**节点**：" + nodeColor(n.NodeName) + "\n" + info
+	}
+
 	elements := []any{
 		mdElement(detail),
 		hrElement(),
-		mdElement(fmt.Sprintf("**容器**：%s\n**镜像**：%s", name, n.ImageRef)),
+		mdElement(info),
 	}
 
 	if state == model.CardFailed || state == model.CardRollback {
@@ -228,4 +239,12 @@ func orDash(s string) string {
 		return "未知"
 	}
 	return s
+}
+
+// nodeColor 节点名染成橙色，和本机提醒区分开。
+//
+// 卡片 2.0 的 markdown 支持 <font color=…>，颜色名用官方词表里的 orange；
+// 写 RGB 或别的写法在客户端会被直接吞掉（只剩文字，没有报错）。
+func nodeColor(node string) string {
+	return "<font color='orange'>" + node + "</font>"
 }

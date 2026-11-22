@@ -68,11 +68,22 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	if n, ok := s.unusedImageCount(r.Context()); ok {
 		unusedImages = n
 	}
+	// 远程节点的待更新数一起回给前端：首页那格「有更新」要的是「我这台 + 所有节点」。
+	// 汇总放在服务端做，前端就不用为了一个数字先去拉一遍节点列表（那个接口很重，
+	// 每台节点都带着整份容器快照）。
+	nodeContainers, nodeUpdates, nerr := s.st.NodeUpdateTotals()
+	if nerr != nil {
+		s.log.Warn("统计节点更新数失败", "err", nerr)
+	}
 	writeOK(w, map[string]any{
-		"total":             total,
-		"up_to_date":        byStatus[string(model.StatusUpToDate)],
-		"update_available":  byStatus[string(model.StatusUpdatePending)],
-		"new_version_tag":   byStatus[string(model.StatusNewTag)],
+		"total":            total,
+		"up_to_date":       byStatus[string(model.StatusUpToDate)],
+		"update_available": byStatus[string(model.StatusUpdatePending)],
+		"new_version_tag":  byStatus[string(model.StatusNewTag)],
+		// 远程节点汇总。前端把它们加进「有更新」那一格，同时在标签上注明
+		// 其中有多少来自节点 —— 否则用户点进容器页只数出本机那几个，会以为算错了。
+		"node_containers":   nodeContainers,
+		"node_update":       nodeUpdates,
 		"unused_images":     unusedImages,
 		"unknown":           byStatus[string(model.StatusUnknown)],
 		"ignored":           byStatus[string(model.StatusIgnored)],
@@ -652,6 +663,47 @@ func (s *Server) handleReadNotification(w http.ResponseWriter, r *http.Request) 
 	}
 	if err := s.st.MarkNotificationRead(id, true); err != nil {
 		writeErr(w, http.StatusInternalServerError, "标记失败: "+err.Error())
+		return
+	}
+	writeOK(w, map[string]any{"id": id})
+}
+
+// handleNotificationUpdate 在网页上对一条提醒执行更新。
+//
+// 前端对「待处理」和「更新中」两种状态都会给按钮，真正的判定在
+// notify.ApplyUpdate 里：还在跑就原样回绝，不会平白再起一个。
+func (s *Server) handleNotificationUpdate(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	n, err := s.st.GetNotification(id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "通知不存在")
+		return
+	}
+	msg, err := s.nt.ApplyUpdate(n)
+	if err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeOK(w, map[string]any{"id": id, "message": msg})
+}
+
+// handleDeleteNotification 删除一条通知。
+func (s *Server) handleDeleteNotification(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.st.DeleteNotification(id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "通知不存在")
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
 	writeOK(w, map[string]any{"id": id})
@@ -1295,7 +1347,23 @@ func (s *Server) LoadSettings() model.Settings {
 	out.FeishuEnabled, out.TelegramEnabled, out.DingTalkEnabled = &feOn, &tgOn, &dtOn
 	out.WeComEnabled = &wcOn
 
+	// 自动升级默认开：远程节点装好之后，用户的诉求就是「别再让我去目标机
+	// 跑命令」。老库里没有这个字段，缺失即开启；不想要可以在设置页关掉。
+	if out.AgentAutoUpgrade == nil {
+		on := true
+		out.AgentAutoUpgrade = &on
+	}
+
 	return out
+}
+
+// AgentAutoUpgrade 节点 Agent 是否自动跟随 Hub 升级。
+//
+// 单独开一个方法给节点通道用：那边只需要这一个开关，不该把整份设置
+// （含飞书凭据、登录口令）传出去。
+func (s *Server) AgentAutoUpgrade() bool {
+	v := s.LoadSettings().AgentAutoUpgrade
+	return v == nil || *v
 }
 
 // enabledOrDefault 开关没设置过时按「这个渠道配齐了没有」推导。

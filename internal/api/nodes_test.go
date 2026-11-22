@@ -1,11 +1,21 @@
 package api
 
 import (
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/haihaipypy/autodocker/internal/hubserver"
+	"github.com/haihaipypy/autodocker/internal/model"
+	"github.com/haihaipypy/autodocker/internal/store"
 )
 
 // 用户填的地址决定了安装命令能不能用。这里只校验形态，不校验连通性 ——
@@ -105,5 +115,99 @@ func TestScriptTemplateUsesQuotedURL(t *testing.T) {
 	script := scriptTemplate(hub, "img:latest")
 	if !strings.Contains(script, "HUB_URL='"+hub+"'") {
 		t.Errorf("Hub 地址没有被单引号包裹:\n%s", script)
+	}
+}
+
+// 远端更新接口的第一道关卡。
+//
+// 拦不住的后果比「接口报错」严重得多：指令一旦发到目标机，那边会真的
+// 停掉容器再重建。所以「没有可用更新」「已被忽略」「容器编号对不上」
+// 这些必须在这里就挡住，而不是指望 Agent 再判一次。
+func TestNodeUpdateRejectsBadRequests(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("打开库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	nodeID, err := st.CreateNode(&model.Node{Name: "测试机", HubURL: "http://h:1"}, hashNodeToken("tok"))
+	if err != nil {
+		t.Fatalf("建节点失败: %v", err)
+	}
+	if err := st.ReplaceNodeContainers(nodeID, []model.NodeContainer{
+		{NodeID: nodeID, ContainerID: "c-upd", ContainerName: "web", ImageRef: "nginx:latest",
+			Origin: model.OriginContainer, Status: model.StatusUpdatePending},
+		{NodeID: nodeID, ContainerID: "c-ok", ContainerName: "db", ImageRef: "redis:7",
+			Origin: model.OriginContainer, Status: model.StatusUpToDate},
+		{NodeID: nodeID, ContainerID: "c-ign", ContainerName: "old", ImageRef: "x:1",
+			Origin: model.OriginContainer, Status: model.StatusIgnored, Ignored: true},
+	}); err != nil {
+		t.Fatalf("写快照失败: %v", err)
+	}
+
+	// 节点从没连过，任何走到「下发」这一步的请求都会因为离线被拒 ——
+	// 这正好让校验分支和下发分支各归各位。
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := &Server{st: st, hub: hubserver.New(hubserver.Config{}, st, logger)}
+
+	cases := []struct {
+		name string
+		body string
+		want int
+		why  string
+	}{
+		{"缺容器编号", `{}`, http.StatusBadRequest, "容器编号"},
+		{"容器不在这台机器上", `{"container_id":"nope"}`, http.StatusNotFound, "没有这个容器"},
+		{"已是最新", `{"container_id":"c-ok"}`, http.StatusConflict, "没有可用的更新"},
+		{"已忽略", `{"container_id":"c-ign"}`, http.StatusConflict, "已被忽略"},
+		{"节点不在线", `{"container_id":"c-upd"}`, http.StatusConflict, "不在线"},
+	}
+
+	for _, c := range cases {
+		req := httptest.NewRequest(http.MethodPost, "/api/nodes/1/update", strings.NewReader(c.body))
+		req.SetPathValue("id", strconv.FormatInt(nodeID, 10))
+		rec := httptest.NewRecorder()
+		s.handleNodeUpdate(rec, req)
+
+		if rec.Code != c.want {
+			t.Errorf("%s：期望 %d，实际 %d（%s）", c.name, c.want, rec.Code, rec.Body.String())
+			continue
+		}
+		if !strings.Contains(rec.Body.String(), c.why) {
+			t.Errorf("%s：拒绝理由应包含 %q，实际 %s", c.name, c.why, rec.Body.String())
+		}
+	}
+}
+
+// 列表接口要把「此刻哪台在更新」一起带出去，前端靠这个画横幅。
+func TestListNodesIncludesOps(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("打开库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := &Server{st: st, hub: hubserver.New(hubserver.Config{}, st, logger)}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/nodes", nil)
+	rec := httptest.NewRecorder()
+	s.handleListNodes(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("期望 200，实际 %d", rec.Code)
+	}
+	var body struct {
+		Nodes []model.Node                  `json:"nodes"`
+		Ops   map[string]*hubserver.OpState `json:"ops"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("响应解析失败: %v（%s）", err, rec.Body.String())
+	}
+	if body.Nodes == nil {
+		t.Error("没有节点时应返回空数组而不是 null")
+	}
+	if body.Ops == nil {
+		t.Error("ops 应是空对象而不是 null —— 前端要拿它直接 Object.keys")
 	}
 }

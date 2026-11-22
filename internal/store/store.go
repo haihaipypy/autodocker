@@ -54,6 +54,9 @@ func (s *Store) migrate() error {
 			reference       TEXT    NOT NULL,
 			container_id    TEXT    NOT NULL DEFAULT '',
 			container_name  TEXT    NOT NULL DEFAULT '',
+			compose_project TEXT    NOT NULL DEFAULT '',
+			compose_service TEXT    NOT NULL DEFAULT '',
+			compose_deps    TEXT    NOT NULL DEFAULT '',
 			origin          TEXT    NOT NULL DEFAULT '',
 			image_id        TEXT    NOT NULL DEFAULT '',
 			size_bytes      INTEGER NOT NULL DEFAULT 0,
@@ -85,6 +88,9 @@ func (s *Store) migrate() error {
 			image_ref         TEXT    NOT NULL,
 			container_id      TEXT    NOT NULL DEFAULT '',
 			container_name    TEXT    NOT NULL DEFAULT '',
+			node_id           INTEGER NOT NULL DEFAULT 0,
+			node_name         TEXT    NOT NULL DEFAULT '',
+			version_key       TEXT    NOT NULL DEFAULT '',
 			kind              TEXT    NOT NULL,
 			title             TEXT    NOT NULL DEFAULT '',
 			body              TEXT    NOT NULL DEFAULT '',
@@ -99,6 +105,9 @@ func (s *Store) migrate() error {
 			chat_ref          TEXT    NOT NULL DEFAULT '',
 			message_id        TEXT    NOT NULL DEFAULT '',
 			card_state        TEXT    NOT NULL DEFAULT 'pending',
+			card_detail       TEXT    NOT NULL DEFAULT '',
+			compose_project   TEXT    NOT NULL DEFAULT '',
+			member_count      INTEGER NOT NULL DEFAULT 1,
 			deliveries        TEXT    NOT NULL DEFAULT '',
 			created_at        INTEGER NOT NULL DEFAULT 0,
 			updated_at        INTEGER NOT NULL DEFAULT 0
@@ -106,12 +115,37 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_notifications_ref ON notifications(image_ref, container_id)`,
 
+		// 一条提醒覆盖的容器。单容器提醒也写一行 —— 去重、结果写回、逐容器
+		// 结果展示全部只看这张表，代码里不必区分「合并的」和「单条的」。
+		`CREATE TABLE IF NOT EXISTS notification_members (
+			id              INTEGER PRIMARY KEY AUTOINCREMENT,
+			notification_id INTEGER NOT NULL,
+			container_id    TEXT    NOT NULL DEFAULT '',
+			container_name  TEXT    NOT NULL DEFAULT '',
+			image_ref       TEXT    NOT NULL DEFAULT '',
+			version_key     TEXT    NOT NULL DEFAULT '',
+			kind            TEXT    NOT NULL DEFAULT '',
+			local_tag       TEXT    NOT NULL DEFAULT '',
+			latest_tag      TEXT    NOT NULL DEFAULT '',
+			local_summary   TEXT    NOT NULL DEFAULT '',
+			remote_summary  TEXT    NOT NULL DEFAULT '',
+			state           TEXT    NOT NULL DEFAULT 'pending',
+			error           TEXT    NOT NULL DEFAULT ''
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_members_notif ON notification_members(notification_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_members_container ON notification_members(notification_id, container_id)`,
+		// 按容器反查「这条容器属于哪条提醒」：结果回写与去重都走这条路径。
+		`CREATE INDEX IF NOT EXISTS idx_notification_members_cid ON notification_members(container_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_members_name ON notification_members(container_name)`,
+
 		`CREATE TABLE IF NOT EXISTS tasks (
 			id               INTEGER PRIMARY KEY AUTOINCREMENT,
 			notification_id  INTEGER NOT NULL DEFAULT 0,
 			image_ref        TEXT    NOT NULL DEFAULT '',
 			container_id     TEXT    NOT NULL DEFAULT '',
 			container_name   TEXT    NOT NULL DEFAULT '',
+			node_id          INTEGER NOT NULL DEFAULT 0,
+			node_name        TEXT    NOT NULL DEFAULT '',
 			new_container_id TEXT    NOT NULL DEFAULT '',
 			status           TEXT    NOT NULL DEFAULT 'pending',
 			triggered_by     TEXT    NOT NULL DEFAULT '',
@@ -167,6 +201,9 @@ func (s *Store) migrate() error {
 			node_id        INTEGER NOT NULL,
 			container_id   TEXT    NOT NULL,
 			container_name TEXT    NOT NULL DEFAULT '',
+			compose_project TEXT   NOT NULL DEFAULT '',
+			compose_service TEXT   NOT NULL DEFAULT '',
+			compose_deps    TEXT   NOT NULL DEFAULT '',
 			image_ref      TEXT    NOT NULL DEFAULT '',
 			image_id       TEXT    NOT NULL DEFAULT '',
 			local_tag      TEXT    NOT NULL DEFAULT '',
@@ -211,6 +248,13 @@ var imageAddedColumns = []struct{ name, ddl string }{
 	// 用户清一次已读历史，同一版本就会重新冒出来。
 	{"notified_tag", "TEXT NOT NULL DEFAULT ''"},
 	{"notified_digest", "TEXT NOT NULL DEFAULT ''"},
+	// 容器所属的 compose 项目。老库补上这一列后先为空，下一轮巡检会填上。
+	{"compose_project", "TEXT NOT NULL DEFAULT ''"},
+	// compose 服务名与 depends_on 列表（后者存 JSON 数组）。
+	// 1.11.0 起用于「按依赖顺序重建」：上游先换、下游后换。
+	// 老 Agent 不上报，两列留空即可，重建顺序退化成以前的行为。
+	{"compose_service", "TEXT NOT NULL DEFAULT ''"},
+	{"compose_deps", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // notificationAddedColumns 是 1.2.4 起为 notifications 表新增的列。
@@ -225,6 +269,25 @@ var notificationAddedColumns = []struct{ name, ddl string }{
 	// 全量投递记录（JSON 数组）。同时配了两个渠道时一条提醒要各发一份，
 	// 只存一个 message_id 就只能改得动其中一个，另一个会一直停在「待更新」。
 	{"deliveries", "TEXT NOT NULL DEFAULT ''"},
+	// 远端节点上的提醒。node_id 为 0 表示本机，老记录默认就是 0，不用回填。
+	{"node_id", "INTEGER NOT NULL DEFAULT 0"},
+	{"node_name", "TEXT NOT NULL DEFAULT ''"},
+	// 去重键。远端快照每轮整体替换，没有 images.notified_tag 那样的地方
+	// 长期记住「这一版说过了」，只能记在通知上。
+	{"version_key", "TEXT NOT NULL DEFAULT ''"},
+	// 卡片上那句结果说明（失败原因、回滚原因）。只存在于 IM 消息里的话，
+	// 网页上就只剩一个「失败」徽章，重启后连消息那边也看不到了。
+	{"card_detail", "TEXT NOT NULL DEFAULT ''"},
+	// 合并提醒：这条提醒对应哪个 compose 项目、覆盖几个容器。
+	// 老记录一律 member_count=1，语义上等同于「单容器提醒」。
+	{"compose_project", "TEXT NOT NULL DEFAULT ''"},
+	{"member_count", "INTEGER NOT NULL DEFAULT 1"},
+}
+
+// taskAddedColumns 是 1.8.2 起为 tasks 表新增的列。
+var taskAddedColumns = []struct{ name, ddl string }{
+	{"node_id", "INTEGER NOT NULL DEFAULT 0"},
+	{"node_name", "TEXT NOT NULL DEFAULT ''"},
 }
 
 // addMissingColumns 给老库补上新增的列。
@@ -235,7 +298,29 @@ func (s *Store) addMissingColumns() error {
 	if err := s.addNodeColumns(); err != nil {
 		return err
 	}
+	if err := s.addNodeContainerColumns(); err != nil {
+		return err
+	}
+	if err := s.addTaskColumns(); err != nil {
+		return err
+	}
 	return s.addNotificationColumns()
+}
+
+func (s *Store) addTaskColumns() error {
+	have, err := s.tableColumns("tasks")
+	if err != nil {
+		return err
+	}
+	for _, col := range taskAddedColumns {
+		if have[col.name] {
+			continue
+		}
+		if _, err := s.db.Exec("ALTER TABLE tasks ADD COLUMN " + col.name + " " + col.ddl); err != nil {
+			return fmt.Errorf("补列 %s 失败: %w", col.name, err)
+		}
+	}
+	return nil
 }
 
 // nodeAddedColumns 是 1.7.5 起为 nodes 表新增的列。
@@ -245,6 +330,18 @@ func (s *Store) addMissingColumns() error {
 // 「在线但还没收到过快照」要显示成巡检中，而不是一个会误导人的 0。
 var nodeAddedColumns = []struct{ name, ddl string }{
 	{"last_report_at", "INTEGER NOT NULL DEFAULT 0"},
+}
+
+// nodeContainerAddedColumns 是 1.10.0 起为 node_containers 表新增的列。
+//
+// 注意这里补的是 node_containers 而不是 nodes：容器所属的 compose 项目属于
+// 快照里的每一行，不属于节点本身。补错表的表现是老库升级后查询直接报
+// no such column: compose_project，节点页的容器列表整块读不出来。
+var nodeContainerAddedColumns = []struct{ name, ddl string }{
+	{"compose_project", "TEXT NOT NULL DEFAULT ''"},
+	// 1.11.0：按 depends_on 排重建顺序要用（compose_deps 存 JSON 数组）。
+	{"compose_service", "TEXT NOT NULL DEFAULT ''"},
+	{"compose_deps", "TEXT NOT NULL DEFAULT ''"},
 }
 
 func (s *Store) addNodeColumns() error {
@@ -268,6 +365,23 @@ func (s *Store) addNodeColumns() error {
 	}
 	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_node_containers_node ON node_containers(node_id)`); err != nil {
 		return fmt.Errorf("重建快照索引失败: %w", err)
+	}
+	return nil
+}
+
+// addNodeContainerColumns 给老库的 node_containers 补列。
+func (s *Store) addNodeContainerColumns() error {
+	have, err := s.tableColumns("node_containers")
+	if err != nil {
+		return err
+	}
+	for _, col := range nodeContainerAddedColumns {
+		if have[col.name] {
+			continue
+		}
+		if _, err := s.db.Exec("ALTER TABLE node_containers ADD COLUMN " + col.name + " " + col.ddl); err != nil {
+			return fmt.Errorf("补列 %s 失败: %w", col.name, err)
+		}
 	}
 	return nil
 }
@@ -356,6 +470,24 @@ func (s *Store) addNotificationColumns() error {
 		); err != nil {
 			return fmt.Errorf("回填消息 ID 失败: %w", err)
 		}
+	}
+	// 老通知没有成员行，补一行出来：去重与结果写回都改成看成员表了，
+	// 不回填等于升级后把老历史当成「没提醒过」，同一批版本再推一遍。
+	if _, err := s.db.Exec(`
+		INSERT INTO notification_members(
+			notification_id, container_id, container_name, image_ref, version_key,
+			kind, local_tag, latest_tag, local_summary, remote_summary, state)
+		SELECT id, container_id, container_name, image_ref, version_key,
+			kind, local_tag, latest_tag, local_summary, remote_summary,
+			CASE card_state
+				WHEN 'done' THEN 'done'
+				WHEN 'failed' THEN 'failed'
+				WHEN 'rollback' THEN 'failed'
+				ELSE 'pending'
+			END
+		FROM notifications
+		WHERE id NOT IN (SELECT notification_id FROM notification_members)`); err != nil {
+		return fmt.Errorf("回填通知成员失败: %w", err)
 	}
 	return nil
 }

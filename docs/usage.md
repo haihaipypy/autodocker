@@ -19,9 +19,16 @@
 
 你点「立即更新」
   ├─ 回调：飞书长连接推 card.action.trigger、钉钉 Stream 与企业微信长连接推卡片回调；Telegram 靠长轮询收 callback_query
+  ├─ 预拉：先把这次要更新的镜像全部拉下来（合并提醒 / 整个项目时是整批一起）；
+  │        任何一个拉不到就停在这里，容器一个都不动
+  ├─ 排序：一次动多个容器时按 compose 的 depends_on 排「上游先、下游后」
+  │        （数据库 → 中间层 → 反代）；没写 depends_on 就保持原来的顺序
   ├─ 拉取：docker pull 新镜像
   ├─ 重建：inspect 原容器 → 停旧 → 改名备份 → 用原配置创建新容器 → 启动
-  ├─ 校验：观察窗口内健康检查（容器是否存活 / HEALTHCHECK 是否 healthy）
+  ├─ 校验：观察窗口内健康检查（容器是否存活 / HEALTHCHECK 是否 healthy）；
+  │        窗口按容器自己的 HEALTHCHECK 配置算（启动宽限 + 重试间隔），到期仍是
+  │        starting 记为「已启动、未确认」，不回滚；中途的 unhealthy 也继续观察，
+  │        到期仍是 unhealthy 才判失败
   └─ 收尾：通过则删除旧容器，不通过则自动回滚并重新拉起旧容器
 ```
 

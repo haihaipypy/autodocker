@@ -266,3 +266,27 @@ func TestMissingForSend(t *testing.T) {
 	}
 	m.Stop()
 }
+
+// 节点信息放在卡片最上面那一行：企业微信的字段行带底色，比标题小字显眼。
+func TestBuildUpdateCardShowsNodeFirst(t *testing.T) {
+	n := &model.Notification{
+		ID: 7, ImageRef: "nginx:latest", ContainerName: "web",
+		Kind: model.NotifNewVersion, Title: "🖥️ nas · web 有新版本可用",
+		NodeName: "nas", LocalSummary: "aaaa", RemoteSummary: "bbbb",
+	}
+	card := BuildUpdateCard(n, "ad-7-1-1")
+	if len(card.ContentList) == 0 || card.ContentList[0].Keyname != "节点" {
+		t.Fatalf("第一行应为节点，实际: %+v", card.ContentList)
+	}
+	if card.ContentList[0].Value != "nas" {
+		t.Errorf("节点名不对: %q", card.ContentList[0].Value)
+	}
+
+	n.NodeName = ""
+	card = BuildUpdateCard(n, "ad-7-1-1")
+	for _, it := range card.ContentList {
+		if it.Keyname == "节点" {
+			t.Error("本机提醒不该出现「节点」这一行")
+		}
+	}
+}

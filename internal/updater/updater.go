@@ -42,12 +42,30 @@ type Request struct {
 	ContainerID   string
 	ContainerName string
 	TriggeredBy   string
+
+	// OnProgress 每一步的进度回调，可为 nil。
+	//
+	// 远端更新要几十秒到几分钟，没有这个回调，Hub 那边只能干等 ——
+	// 用户看到的是按钮点下去毫无反应，于是反复点。回调在每次写任务日志时
+	// 触发一次，参数就是那行日志文案，调用方自己决定节流与转发。
+	OnProgress func(line string)
 }
 
 // PullRequest 一次「只拉镜像」的请求。
 type PullRequest struct {
 	TaskID   int64
 	ImageRef string
+
+	// Preload 表示这是批量更新前的预拉：镜像落地即可，不动监控项状态。
+	//
+	// 动了就会出事：刷新那段会把 LatestTag 清空，紧接着的重建再推导目标引用时
+	// 只看到旧 tag，本来要升到 9.4.7 的容器会被重建成 9.4.3 —— 镜像拉对了、
+	// 容器还是旧的，而且状态显示「已是最新」。
+	Preload bool
+
+	// OnProgress 每一步的日志回调，可为 nil。拉大镜像可能要好几分钟，
+	// 没有它，远端节点在 Hub 看来是「静默」的。
+	OnProgress func(line string)
 }
 
 // Updater 更新执行器。同一时刻只允许一个更新在跑，避免并发重建互相踩踏。
@@ -118,6 +136,10 @@ func (u *Updater) Run(ctx context.Context, req Request) error {
 		u.log.Info(line, "task_id", req.TaskID, "container", req.ContainerName)
 		if err := u.st.AppendTaskLog(req.TaskID, "["+time.Now().Format("15:04:05")+"] "+line); err != nil {
 			u.log.Warn("写入任务日志失败", "err", err)
+		}
+		// 回调放在落库之后：万一回调把连接写挂了，本地任务记录仍然是完整的。
+		if req.OnProgress != nil {
+			req.OnProgress(line)
 		}
 	}
 	fail := func(err error) error {
@@ -238,8 +260,9 @@ func (u *Updater) Run(ctx context.Context, req Request) error {
 	}
 
 	// 健康检查：确认新容器真的活了再清理旧容器
+	healthMsg := ""
 	if wasRunning {
-		ok, msg := u.waitHealthy(ctx, newID, opt.HealthCheckWait, logf)
+		ok, msg, confirmed := u.waitHealthy(ctx, newID, opt.HealthCheckWait, logf)
 		if !ok {
 			if opt.RollbackOnFailure {
 				logf("健康检查未通过（%s），执行回滚", msg)
@@ -251,12 +274,23 @@ func (u *Updater) Run(ctx context.Context, req Request) error {
 			_ = u.st.FinishTask(req.TaskID, model.TaskFailed, newID, msg)
 			return errors.New(msg)
 		}
-		logf("健康检查通过：%s", msg)
+		if confirmed {
+			logf("健康检查通过：%s", msg)
+		} else {
+			// 容器在跑、只是探测还没出结果。不回滚 —— 回滚会把一个
+			// 正在启动的服务打断，比「未确认」糟得多。
+			healthMsg = msg
+			logf("健康检查未确认：%s（容器保持运行）", msg)
+		}
 	}
 
 	// 更新成功
 	if opt.KeepOldContainer {
 		logf("保留旧容器 %s（按配置未删除）", backupName)
+	} else if healthMsg != "" {
+		// 容器在跑但健康检查没给出结论，先别删旧容器：
+		// 万一是真的起不来，这个改名后的旧容器就是唯一的回滚现场。
+		logf("健康检查未确认，旧容器保留为 %s（确认没问题后可手动删除）", backupName)
 	} else {
 		logf("清理旧容器 %s", backupName)
 		if err := u.dk.RemoveContainer(ctx, req.ContainerID, false, false); err != nil {
@@ -268,7 +302,7 @@ func (u *Updater) Run(ctx context.Context, req Request) error {
 	// 刷新监控项：容器号变了，引用也可能变（v3.6.0 → v3.7.0 这类升 tag 的重建）。
 	u.refreshMonitor(ctx, req, newID, origName)
 
-	_ = u.st.FinishTask(req.TaskID, model.TaskSuccess, newID, "")
+	_ = u.st.FinishTask(req.TaskID, model.TaskSuccess, newID, healthMsg)
 	return nil
 }
 
@@ -443,12 +477,19 @@ func (u *Updater) Pull(ctx context.Context, req PullRequest) error {
 		if err := u.st.AppendTaskLog(req.TaskID, "["+time.Now().Format("15:04:05")+"] "+line); err != nil {
 			u.log.Warn("写入任务日志失败", "err", err)
 		}
+		if req.OnProgress != nil {
+			req.OnProgress(line)
+		}
 	}
 
 	if err := u.st.StartTask(req.TaskID, ""); err != nil {
 		u.log.Warn("更新任务状态失败", "err", err)
 	}
-	logf("开始拉取镜像 %s", req.ImageRef)
+	if req.Preload {
+		logf("开始预拉镜像 %s（批量更新的第一步，不会重建容器）", req.ImageRef)
+	} else {
+		logf("开始拉取镜像 %s", req.ImageRef)
+	}
 
 	pullCtx, cancel := context.WithTimeout(ctx, opt.PullTimeout)
 	err := u.dk.PullImage(pullCtx, req.ImageRef, func(format string, args ...any) {
@@ -463,34 +504,40 @@ func (u *Updater) Pull(ctx context.Context, req PullRequest) error {
 
 	// 拉取之后本地那份已经换掉了：镜像 ID、大小、摘要都得重新采一遍，
 	// 否则页面上还挂着旧摘要，状态会一直显示成「有更新」。
-	if img, ferr := u.st.FindImage(req.ImageRef, ""); ferr == nil {
-		fresh := *img
-		if list, lerr := u.dk.ListImages(ctx); lerr == nil {
-			for _, it := range list {
-				matched := false
-				for _, tag := range it.Tags {
-					if tag == req.ImageRef {
-						matched = true
+	//
+	// 预拉（批量更新的第一步）跳过这段：这一步还没有容器被重建，
+	// 提前把记录改成「已是最新」会让页面在整批跑完前就显示更新成功，
+	// 也会把 LatestTag 清掉 —— 后面的重建就不知道该升到哪个 tag 了。
+	if !req.Preload {
+		if img, ferr := u.st.FindImage(req.ImageRef, ""); ferr == nil {
+			fresh := *img
+			if list, lerr := u.dk.ListImages(ctx); lerr == nil {
+				for _, it := range list {
+					matched := false
+					for _, tag := range it.Tags {
+						if tag == req.ImageRef {
+							matched = true
+							break
+						}
+					}
+					if matched {
+						fresh.ImageID = it.ID
+						fresh.SizeBytes = it.Size
+						fresh.ImageCreated = it.Created
 						break
 					}
 				}
-				if matched {
-					fresh.ImageID = it.ID
-					fresh.SizeBytes = it.Size
-					fresh.ImageCreated = it.Created
-					break
-				}
 			}
-		}
-		if _, d, derr := u.dk.DigestForImage(ctx, fresh.ImageID, req.ImageRef); derr == nil {
-			fresh.LocalDigest = d
-		}
-		fresh.Status = model.StatusUpToDate
-		fresh.LastError = ""
-		fresh.LatestTag = ""
-		fresh.Aliases = nil
-		if _, uerr := u.st.UpsertImage(&fresh); uerr != nil {
-			u.log.Warn("刷新镜像记录失败", "err", uerr)
+			if _, d, derr := u.dk.DigestForImage(ctx, fresh.ImageID, req.ImageRef); derr == nil {
+				fresh.LocalDigest = d
+			}
+			fresh.Status = model.StatusUpToDate
+			fresh.LastError = ""
+			fresh.LatestTag = ""
+			fresh.Aliases = nil
+			if _, uerr := u.st.UpsertImage(&fresh); uerr != nil {
+				u.log.Warn("刷新镜像记录失败", "err", uerr)
+			}
 		}
 	}
 
@@ -518,45 +565,184 @@ func (u *Updater) rollback(ctx context.Context, newID, oldID, origName string, w
 	}
 }
 
+// 健康检查窗口的硬上限。再慢的容器也不该让整批挂在这里：
+// 到点容器仍在跑就按「已启动、未确认」处理，回滚反而可能打断一个正在启动的服务。
+const maxHealthWindow = 10 * time.Minute
+
+// 定义了健康检查的容器，观察窗口至少这么长。
+//
+// 20 秒连一次探测都跑不完：interval 15 秒的容器第一次探测失败后，
+// 下一次要再等 15 秒，而这时候窗口早就到期了。safeline-mgt 更极端，
+// 它要 70 秒才 ready，中途还会先报 unhealthy。窗口下限就是给这类
+// 「启动慢 + 有健康检查」的容器留出来的余量。
+const minHealthWindow = 2 * time.Minute
+
 // waitHealthy 在新容器启动后做一段健康确认。
 //
 // 判断依据：
 //   - 容器退出 → 立即失败；
-//   - 定义了 HEALTHCHECK 且变为 healthy → 通过；变为 unhealthy → 失败；
-//   - 未定义 HEALTHCHECK → 在观察窗口内持续运行即视为通过。
-func (u *Updater) waitHealthy(ctx context.Context, id string, window time.Duration, logf func(string, ...any)) (bool, string) {
+//   - health 变为 healthy → 通过；变为 unhealthy → 失败（这是真的连续探测失败）；
+//   - 未定义 HEALTHCHECK → 在观察窗口内持续运行即视为通过；
+//   - 窗口到期仍是 starting → 通过，但标记为「未确认」。
+//
+// 最后一条是踩过坑之后加的：safeline-detector 的 HEALTHCHECK 是
+// interval=15s / retries=5，第一次探测在启动后 15 秒，失败一次就要再等 15 秒，
+// 而默认窗口只有 20 秒 —— 每次都停在 starting 被当成失败回滚。
+// starting 的含义是「还没验完」，不是「不健康」，不该判死。
+//
+// 窗口本身也不写死：按容器自己的 Healthcheck 配置算
+// start_period + interval × retries + timeout，与用户设置值取较大者。
+//
+// unhealthy 也不立刻判死。safeline-mgt 就是反例：它的 healthcheck 由 compose
+// 注入（探测 1443 的 /api/open/health），没有 start_period，服务本身要 70 秒
+// 才 ready。探测在启动期连续失败就会先变成 unhealthy，等 readiness 上来
+// 又自己转回 healthy —— 这期间容器一直是活的、正在启动。以 unhealthy
+// 为终局会把「慢启动」当成「起不来」，回滚掉一个马上就好了的服务。
+// 所以 unhealthy 只当作「观察中」，窗口到期仍 unhealthy 才算失败。
+func (u *Updater) waitHealthy(ctx context.Context, id string, window time.Duration, logf func(string, ...any)) (ok bool, msg string, confirmed bool) {
 	if window <= 0 {
-		window = 15 * time.Second
+		window = 20 * time.Second
 	}
-	deadline := time.Now().Add(window)
+	if insp, err := u.dk.InspectContainer(ctx, id); err == nil {
+		if w := healthWindow(insp); w > 0 {
+			// 定义了健康检查的容器，窗口不能短于 minHealthWindow：
+			// 探测间隔 + 启动时间很容易超过用户设置的 20 秒。
+			if w < minHealthWindow {
+				w = minHealthWindow
+			}
+			if w > window {
+				logf("该容器的健康检查比默认窗口更长，观察时间延长到 %s", humanDuration(w))
+				window = w
+			}
+		}
+	}
+
+	start := time.Now()
+	deadline := start.Add(window)
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
+	lastLog := start
+	sawUnhealthy := false
 
 	for {
 		running, health, status, err := u.dk.State(ctx, id)
 		if err != nil {
-			return false, "读取新容器状态失败: " + err.Error()
+			return false, "读取新容器状态失败: " + err.Error(), false
 		}
 		switch {
 		case !running:
-			return false, "新容器已退出（状态 " + status + "）"
+			return false, "新容器已退出（状态 " + status + "）", false
 		case health == "healthy":
-			return true, "健康检查状态 healthy"
-		case health == "unhealthy":
-			return false, "健康检查状态 unhealthy"
-		}
-		if time.Now().After(deadline) {
-			if health == "starting" {
-				return false, "健康检查在观察窗口内未完成（仍为 starting）"
+			if sawUnhealthy {
+				logf("健康检查已恢复 healthy（期间曾报 unhealthy，属启动期正常波动）")
 			}
-			return true, "容器保持运行（未定义健康检查或已通过观察）"
+			return true, "健康检查状态 healthy", true
+		case health == "unhealthy" && !sawUnhealthy:
+			sawUnhealthy = true
+			logf("健康检查报 unhealthy，继续观察到 %s 再判断（容器启动慢时会先失败后恢复）", humanDuration(window))
+		}
+		if !time.Now().Before(deadline) {
+			if sawUnhealthy || health == "unhealthy" {
+				return false, fmt.Sprintf("健康检查连续探测失败（unhealthy），%s 内没有恢复", humanDuration(window)), false
+			}
+			if health == "starting" {
+				return true, fmt.Sprintf("容器已启动，健康检查 %s 内尚未给出结果（仍为 starting）", humanDuration(window)), false
+			}
+			return true, "容器保持运行（未定义健康检查或已通过观察）", true
+		}
+		// 每 10 秒留一行：远端节点靠这些进度行判断「还在跑」。
+		// 一直静默到窗口结束，Hub 那边会当成没有回传进度。
+		if time.Since(lastLog) >= 10*time.Second {
+			lastLog = time.Now()
+			h := health
+			if h == "" {
+				h = "无健康检查"
+			}
+			logf("等待健康检查通过（%s）：已等 %s / 上限 %s", h, humanDuration(time.Since(start)), humanDuration(window))
 		}
 		select {
 		case <-ctx.Done():
-			return false, "等待健康检查被取消"
+			return false, "等待健康检查被取消", false
 		case <-ticker.C:
 		}
 	}
+}
+
+// healthWindow 按容器自己的 HEALTHCHECK 配置算出该等多久。
+//
+// 参数来自 inspect 的 Config.Healthcheck（镜像定义的，容器继承）：
+// interval 是两次探测的间隔，retries 是连续失败多少次才判 unhealthy，
+// start_period 是启动宽限期。三段加起来才是「最坏情况多久能拿到结论」，
+// 少算任何一段都会提前判死 —— 探测失败一次就得再等一个 interval。
+func healthWindow(insp *dockerx.Inspect) time.Duration {
+	if insp == nil || insp.Config == nil {
+		return 0
+	}
+	raw, ok := insp.Config["Healthcheck"].(map[string]any)
+	if !ok {
+		return 0
+	}
+	// ["NONE"] 是显式关闭健康检查，等价于没定义。
+	// Test 缺失或为空同样说明没有可执行的探测，不按默认值硬凑一个窗口。
+	test, ok := raw["Test"].([]any)
+	if !ok || len(test) == 0 {
+		return 0
+	}
+	if s, _ := test[0].(string); strings.EqualFold(s, "NONE") {
+		return 0
+	}
+
+	interval := durationField(raw["Interval"], 30*time.Second)
+	timeout := durationField(raw["Timeout"], 30*time.Second)
+	startPeriod := durationField(raw["StartPeriod"], 0)
+	retriesNum, _ := numberField(raw["Retries"], 3)
+	retries := int(retriesNum)
+	if retries < 1 {
+		retries = 1
+	}
+
+	d := startPeriod + interval*time.Duration(retries) + timeout + 10*time.Second
+	if d > maxHealthWindow {
+		d = maxHealthWindow
+	}
+	return d
+}
+
+// durationField 读 inspect 里的时长字段。JSON 里 time.Duration 编码为纳秒整数，
+// 解到 map[string]any 后是 float64。
+func durationField(v any, def time.Duration) time.Duration {
+	n, ok := numberField(v, 0)
+	if !ok || n <= 0 {
+		return def
+	}
+	return time.Duration(n)
+}
+
+func numberField(v any, def int64) (int64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return int64(x), true
+	case int64:
+		return x, true
+	case int:
+		return int64(x), true
+	case json.Number:
+		n, err := x.Int64()
+		return n, err == nil
+	}
+	return def, false
+}
+
+// humanDuration 把时长写成页面上看得懂的话。
+func humanDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%d 秒", int(d.Seconds()))
+	}
+	if d%time.Minute == 0 {
+		return fmt.Sprintf("%d 分钟", int(d.Minutes()))
+	}
+	return fmt.Sprintf("%d 分 %d 秒", int(d.Minutes()), int(d.Seconds())%60)
 }
 
 // buildSpec 从 inspect 结果还原出重建容器所需的全部配置。

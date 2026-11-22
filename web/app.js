@@ -25,6 +25,22 @@ const state = {
   // 按需拉取而不是随每次轮询全量取：节点多了之后「全部容器」是个大响应，
   // 而用户同一时刻通常只看一台。
   nodeOpen: new Map(),
+  // 展开的节点 id → 读取快照失败的原因。
+  // 读失败和「真的没有容器」必须分开：以前失败时把列表置空，页面就写
+  // 「这台机器上除 Agent 自身外没有其它容器」，而卡片上还挂着 8 个容器、6 项待更新。
+  nodeErr: new Map(),
+  // 节点 id → 正在进行中的操作（目前只有更新）。
+  // Hub 的列表接口每次都带回来，所以进度是跟着轮询自己走的，不需要长连接。
+  nodeOps: {},
+  // 节点 id → 一次「整项目依次更新」的进度（第几个 / 一共几个 / 卡在哪个）。
+  // 与 ops 分开：ops 说的是「此刻正在动哪个容器」，这份说「这一批还剩几个」。
+  nodeBatches: {},
+  // 升级相关：版本落后的节点、正在升级的节点、每台上一次的结局。
+  // 三样都由列表接口一起带回来，前端不做版本比较 —— 比版本的规则只该有一份。
+  nodeUpgradable: new Set(),
+  nodeUpgrading: new Set(),
+  nodeUpgradeLast: {},
+  hubVersion: '',
 };
 
 /* ---------- 登录态 ---------- */
@@ -41,6 +57,9 @@ let pollTimer = null;
 let pollBusy = false;
 // 空闲状态下每多少轮做一次整份重载
 let idleTicks = 0;
+// 上一轮轮询时有几个节点在更新。用来识别「刚跑完」的那一刻 ——
+// 结束的那一轮要再拉一次容器，否则行状态会停在「待更新」。
+let lastRunningOps = 0;
 // 登录层还挂着的时候不要打接口：会 401，还会弹一串没用的提示
 let uiReady = false;
 
@@ -231,6 +250,9 @@ const STATUS = {
   up_to_date: { text: '已是最新', cls: 'ok' },
   update_available: { text: '有更新', cls: 'warn' },
   new_version_tag: { text: '可选更新', cls: 'info' },
+  // 一个 compose 项目里有成员没查出结果。与「未知」分开：未知是单个容器的状态，
+  // 这里是整行的结论，得让用户一眼看出「没查全」而不是「不用更新」。
+  check_error: { text: '检测异常', cls: 'danger' },
   unknown: { text: '未知', cls: 'muted' },
   ignored: { text: '已忽略', cls: 'muted' },
 };
@@ -272,16 +294,27 @@ function badge(map, key) {
 // 并排放着看的人会以为数重了。
 function renderStats() {
   const s = state.stats || {};
+  // 「有更新」这一格说的是「你总共还欠多少个容器要更新」，所以要把远程节点算进来 ——
+  // 只管本机的话，接了三台 NAS 的人得挨个点开节点页才知道真实工作量。
+  // 本机与节点分开留着，是为了标签上能注明其中多少来自节点：数字合在一起、
+  // 点进容器页却只数出本机那几个，最容易让人以为哪里算错了。
+  const localUpdates = s.update_available || 0;
+  const nodeUpdates = s.node_update || 0;
   const items = [
     { label: '监控容器', value: s.total || 0, cls: '' },
-    { label: '有更新', value: s.update_available || 0, cls: 'warn' },
+    {
+      label: nodeUpdates > 0 ? `有更新 · 含节点 ${nodeUpdates}` : '有更新',
+      value: localUpdates + nodeUpdates,
+      cls: 'warn',
+      title: nodeUpdates > 0 ? `本机 ${localUpdates} + 远程节点 ${nodeUpdates}` : '',
+    },
     // 后端读不到 Docker 时给 null —— 显示「—」，别拿 0 假装「没有可清理的」
     { label: '未使用镜像', value: s.unused_images == null ? '—' : s.unused_images, cls: 'info' },
     { label: '未读通知', value: s.unread || 0, cls: 'accent' },
     { label: '已是最新', value: s.up_to_date || 0, cls: 'ok' },
   ];
   $('#stats').innerHTML = items.map((it) => `
-    <div class="stat ${it.cls}">
+    <div class="stat ${it.cls}"${it.title ? ` title="${esc(it.title)}"` : ''}>
       <div class="stat-value">${it.value}</div>
       <div class="stat-label">${it.label}</div>
     </div>
@@ -516,6 +549,15 @@ function renderImages() {
   $('#images-body').innerHTML = html;
 }
 
+// nodeTag 标出这条记录发生在哪台机器上。
+//
+// 本机不加标签：绝大多数记录都是本机的，每行都挂一个「本机」只是噪声；
+// 真正需要区分的是「这条其实是在另一台机器上跑的」。
+function nodeTag(id, name) {
+  if (!id) return '';
+  return ` <span class="badge muted">${esc(name || '节点 ' + id)}</span>`;
+}
+
 function renderTasks() {
   if (!state.tasks.length) {
     $('#tasks-body').innerHTML = '<div class="empty">还没有更新记录。</div>';
@@ -525,7 +567,7 @@ function renderTasks() {
     <div class="row clickable" data-task="${t.id}">
       <div class="cell narrow mono">#${t.id}</div>
       <div class="cell grow">
-        <div class="cell-main">${esc(t.container_name || '—')}</div>
+        <div class="cell-main">${esc(t.container_name || '—')}${nodeTag(t.node_id, t.node_name)}</div>
         <div class="cell-sub">${esc(t.image_ref)}</div>
       </div>
       <div class="cell col-status center">${badge(TASK, t.status)}</div>
@@ -545,16 +587,87 @@ function renderTasks() {
   `).join('');
 }
 
+// notifUpdateBtn 一条提醒上的「更新」入口。
+//
+// 待处理时是「立即更新」，卡在更新中时是「重试更新」——后者只在真的没在跑
+// 时才会生效，服务端会先确认一遍。失败 / 已回滚的也能重来：那次失败多半是
+// 一次性的（镜像源抽了一下、目标机磁盘满），修好之后最自然的动作就是原地点一次，
+// 而不是先把记录删掉再等下一轮巡检重新推。已忽略 / 已稍后 / 已完成的不给按钮：
+// 那些状态下再点一次没有意义，只会让人以为能重来。
+function notifUpdateBtn(n) {
+  if (n.card_state === 'pending') {
+    return `<button class="btn small primary" data-notif-update="${n.id}"
+      title="在这条提醒对应的机器上按原配置重建容器">立即更新</button>`;
+  }
+  if (n.card_state === 'updating' || n.card_state === 'failed' || n.card_state === 'rollback') {
+    const tip = n.card_state === 'updating'
+      ? '如果那次更新其实已经结束（服务重启、连接断开留下的状态），点它重新下发一遍'
+      : '重新下发一次更新；上次失败的原因写在下面那行红字里';
+    return `<button class="btn small ghost" data-notif-update="${n.id}" title="${tip}">重试更新</button>`;
+  }
+  return '';
+}
+
+// notifDetail 上一次更新的结果说明。
+//
+// 只在失败与回滚时露出来：成功那句「已重建完成」每行都挂一遍只是噪声。
+// 而失败时它就是唯一能照做的线索 —— 网页上原来只有一个「失败」徽章，
+// 用户既看不出是拉不到镜像、还是容器起不来，也没法把原因贴出来求助。
+//
+// 老记录（这一版之前失败的）没有存原因，给一句能照着做的话：
+// 让用户知道点上「重试更新」跑一次就能拿到真正的报错。
+function notifDetail(n) {
+  if (n.card_state !== 'failed' && n.card_state !== 'rollback') return '';
+  if (!n.card_detail) {
+    return '<div class="notif-detail dim">这次失败发生在旧版本，原因没有记录。点「重试更新」重新执行一次，若仍失败会在下面写出具体原因。</div>';
+  }
+  return `<div class="notif-detail">${esc(n.card_detail)}</div>`;
+}
+
+// 合并提醒里每个容器自己的结果。
+const MEMBER_STATE = {
+  pending: { text: '待更新', cls: 'warn' },
+  updating: { text: '更新中', cls: 'info' },
+  done: { text: '已更新', cls: 'ok' },
+  failed: { text: '失败', cls: 'danger' },
+};
+
+// notifMembers 合并提醒的成员清单。
+//
+// 单容器提醒不显示：那一行本来就只有它自己，再列一遍纯属噪声。
+// 合并的必须列出来 —— 卡片上写着「6 个容器」，用户得能看清是哪 6 个、
+// 哪个成功了、哪个卡住了，否则「部分成功」只是一句没法验证的话。
+function notifMembers(n) {
+  if (!n.members || n.members.length < 2) return '';
+  const items = n.members.map((m) => {
+    const st = MEMBER_STATE[m.state] || { text: m.state || '待更新', cls: 'warn' };
+    const name = esc(m.container_name || m.image_ref);
+    const tip = m.error ? ` title="${esc(m.error)}"` : '';
+    return `<span class="notif-member"${tip}>${name}<span class="badge ${st.cls}">${st.text}</span></span>`;
+  }).join('');
+  return `<div class="notif-members">${items}</div>`;
+}
+
+function notifSub(n) {
+  const count = n.members && n.members.length ? n.members.length : (n.member_count || 1);
+  if (count > 1) {
+    return `${esc(n.compose_project || '同一个项目')} · ${count} 个容器`;
+  }
+  return `${esc(n.container_name || '（远端监控）')} · ${esc(n.image_ref)}`;
+}
+
 function renderNotifications() {
   if (!state.notifications.length) {
     $('#notifications-body').innerHTML = '<div class="empty">暂无通知。</div>';
     return;
   }
   $('#notifications-body').innerHTML = state.notifications.map((n) => `
-    <div class="row">
+    <div class="row notif-row">
       <div class="cell grow">
         <div class="cell-main">${n.read ? '' : '<span class="dot"></span>'}${esc(n.title || n.image_ref)}</div>
-        <div class="cell-sub">${esc(n.container_name || '（远端监控）')} · ${esc(n.image_ref)}</div>
+        <div class="cell-sub">${notifSub(n)}</div>
+        ${notifMembers(n)}
+        ${notifDetail(n)}
       </div>
       <div class="cell col-kind">
         <div class="cell-sub">类型</div>
@@ -574,7 +687,10 @@ function renderNotifications() {
         <div class="cell-main">${esc(fmtTime(n.created_at))}</div>
       </div>
       <div class="cell actions">
+        ${notifUpdateBtn(n)}
         ${n.read ? '' : `<button class="btn small ghost" data-read="${n.id}">标为已读</button>`}
+        <button class="btn small ghost danger" data-notif-del="${n.id}"
+          title="只删这条记录；同一版本若仍可更新，下一轮巡检会再提醒一次">删除</button>
       </div>
     </div>
   `).join('');
@@ -629,12 +745,31 @@ function renderNodes() {
     // 心跳只证明连着，快照才证明容器数据是新的。刚装好、或巡检正跑第一轮时
     // 快照还没到，这时候显示 0 会让人以为这台机器空着。
     const pending = n.status === 'online' && !hasTime(n.last_report_at);
-    const meta = [n.hostname, n.os, n.agent_version ? 'Agent ' + n.agent_version : '']
-      .filter(Boolean).join(' · ');
+    // ops 的 key 是数字，经过 JSON 之后成了字符串，取的时候必须 String()
+    const op = state.nodeOps[String(n.id)];
+    const batch = state.nodeBatches[String(n.id)];
+    const upgradable = state.nodeUpgradable.has(n.id);
+    const upgrading = state.nodeUpgrading.has(n.id);
+    const lastUp = state.nodeUpgradeLast[String(n.id)];
+    const loadErr = state.nodeErr.get(n.id);
+    // 版本落后时直接把「现在是哪一版、要升到哪一版」摆在 meta 行里，
+    // 用户不用去猜「升级」按钮会升到什么版本。
+    const verText = n.agent_version
+      ? 'Agent ' + n.agent_version + (upgradable && state.hubVersion ? ' → ' + state.hubVersion : '')
+      : '';
+    const meta = [n.hostname, n.os, verText].filter(Boolean).join(' · ');
+    // 上次升级失败的原因留在卡片上：升级失败时节点版本没变，
+    // 除了这一行，页面上看不出任何「刚才试过但没成」的痕迹。
+    const upNote = (!upgrading && lastUp && !lastUp.ok)
+      ? `<div class="cell-err" title="${esc(lastUp.error || '')}">上次升级未成功：${esc(shortErr(lastUp.error || '未知原因'))}</div>`
+      : '';
     const detail = open
-      ? `<div class="node-detail">${list === null
-        ? '<div class="empty">正在读取…</div>'
-        : (pending && !list.length ? '<div class="empty">正在巡检，结果稍后自动出现。</div>' : nodeContainerRows(list))}</div>`
+      ? `<div class="node-detail">${loadErr
+        ? `<div class="node-load-err">读取节点容器失败：${esc(loadErr)}
+            <button class="btn small ghost" data-node-reload="${n.id}">重试</button></div>`
+        : list === null
+          ? '<div class="empty">正在读取…</div>'
+          : (pending && !list.length ? '<div class="empty">正在巡检，结果稍后自动出现。</div>' : nodeContainerRows(list, n, op, batch))}</div>`
       : '';
     return `
     <div class="node-card">
@@ -646,6 +781,7 @@ function renderNodes() {
           </div>
           <div class="cell-sub">${esc(meta || '尚未上报信息')}</div>
           <div class="cell-sub mono">${esc(n.hub_url || '—')}</div>
+          ${upNote}
         </div>
         <div class="cell col-tag">
           <div class="cell-sub">容器</div>
@@ -662,29 +798,97 @@ function renderNodes() {
           <div class="cell-main">${hasTime(n.last_seen_at) ? fmtTime(n.last_seen_at) : '—'}</div>
         </div>
         <div class="cell actions">
+          ${(upgradable || upgrading) ? `<button class="btn small ${upgrading ? 'ghost' : 'primary'}"
+            data-node-upgrade="${n.id}" ${(upgrading || n.status !== 'online') ? 'disabled' : ''}
+            title="把这台机器上的 Agent 换成 Hub 这一版，节点会重启一次">${upgrading ? '升级中…' : '升级 Agent'}</button>` : ''}
           <button class="btn small ghost" data-node-scan="${n.id}" ${n.status === 'online' ? '' : 'disabled'}>立即巡检</button>
           <button class="btn small ghost" data-node-token="${n.id}">重发命令</button>
           <button class="btn small ghost danger" data-node-del="${n.id}">删除</button>
         </div>
       </div>
+      ${opBanner(op)}
       ${detail}
     </div>`;
   }).join('');
+}
+
+// opBanner 一条「这台机器此刻在干什么」的横幅。
+//
+// 不做进度条：拉镜像的层进度对用户没有意义（99% 卡十分钟是常态），
+// 反而让人以为出问题了。给当前动作的一句话就够，动没动看得见。
+function opBanner(op) {
+  if (!op) return '';
+  const running = op.phase !== 'done' && op.phase !== 'failed';
+  const cls = op.phase === 'failed' ? 'danger' : (running ? 'busy' : 'ok');
+  const label = op.phase === 'failed' ? '更新失败' : (running ? '正在更新' : '更新完成');
+  const who = op.container_name ? ' ' + op.container_name : '';
+  // 只在「有额外信息」的阶段显示后半句：进行中显示当前动作、失败显示原因。
+  // start 的「开始更新 X」和 done 的「更新完成」跟前面的标签重复，说了等于没说。
+  const detail = op.phase === 'failed' || op.phase === 'progress';
+  const msg = detail && op.message ? `<span class="node-op-msg">${esc(op.message)}</span>` : '';
+  return `<div class="node-op ${cls}">
+    <span class="node-op-dot"></span>
+    <b>${label}${esc(who)}</b>${msg}
+  </div>`;
 }
 
 // nodeContainerRows 渲染某台机器上的容器。
 //
 // 只列容器维度的项（origin=container）：镜像维度那几条（本机存在但没人用的镜像、
 // 纯远端盯梢）在节点页没有操作入口，摆出来只会让人以为它们也能在这里更新。
-function nodeContainerRows(list) {
+//
+// 同一个 compose 项目里有多个容器时合成一行：safeline 这种项目一次发版就是
+// 六个服务，六个「更新」按钮要挨个点六次，而且每点一次还要等它跑完再点下一个。
+function nodeContainerRows(list, node, op, batch) {
   const items = (list || []).filter((c) => c.origin === 'container');
   if (!items.length) return '<div class="empty">这台机器上除 Agent 自身外没有其它容器。</div>';
-  return `<div class="node-containers">${items.map((c) => `
+  const rows = groupNodeItems(items)
+    .map((g) => (g.members.length > 1 ? nodeProjectRow(g, node, op, batch) : nodeOneRow(g.members[0], node, op)))
+    .join('');
+  return `<div class="node-containers">${rows}</div>`;
+}
+
+// groupNodeItems 按 compose 项目归组，顺序沿用后端给的顺序。
+//
+// 只有一个容器的项目不合并成「项目行」：合并等于什么也没做，
+// 反而把用户认得的容器名藏起来了。
+function groupNodeItems(items) {
+  const groups = new Map();
+  const order = [];
+  items.forEach((c) => {
+    const key = c.compose_project || '';
+    if (!key) {
+      order.push({ project: '', members: [c] });
+      return;
+    }
+    let g = groups.get(key);
+    if (!g) {
+      g = { project: key, members: [] };
+      groups.set(key, g);
+      order.push(g);
+    }
+    g.members.push(c);
+  });
+  return order.map((g) => (g.members.length > 1 ? g : { project: '', members: g.members }));
+}
+
+function hasUpdate(c) {
+  return c.status === 'update_available' || c.status === 'new_version_tag';
+}
+
+function nodeOneRow(c, node, op) {
+  // 查不动的那一个：状态写「检测异常」而不是「未知」，原因整句铺出来。
+  //
+  // 截到 64 字会把真正有用的那句切掉 —— 镜像源的错误通常是「所有镜像源均失败：
+  // 源 A（401 要求登录认证）；源 B（403 免费节点当前繁忙）」，后半截才是能照着做的。
+  const bad = c.status === 'unknown' || !!c.last_error;
+  const shown = bad ? 'check_error' : c.status;
+  return `
     <div class="row">
       <div class="cell grow">
         <div class="cell-main">${esc(c.container_name || '—')}</div>
         <div class="cell-sub">${esc(c.image_ref)}</div>
-        ${c.last_error ? `<div class="cell-err" title="${esc(c.last_error)}">${esc(shortErr(c.last_error))}</div>` : ''}
+        ${c.last_error ? `<div class="cell-err wrap" title="${esc(c.last_error)}">${esc(shortErr(c.last_error, 110))}</div>` : ''}
       </div>
       <div class="cell col-tag">
         <div class="cell-sub">当前</div>
@@ -694,14 +898,137 @@ function nodeContainerRows(list) {
         <div class="cell-sub">可用</div>
         <div class="cell-main mono">${esc(c.latest_tag || (c.status === 'update_available' ? '内容已更新' : '—'))}</div>
       </div>
-      <div class="cell col-mode">${badge(STATUS, c.status)}</div>
-    </div>`).join('')}</div>`;
+      <div class="cell col-mode">${badge(STATUS, shown)}</div>
+      <div class="cell actions">${nodeUpdateButton(c, node, op)}</div>
+    </div>`;
+}
+
+// batchFailText 把批次的失败原因拼成一句话。
+//
+// 预拉阶段本来就没开始重建，写「X 更新失败：拉取镜像失败：…」会读成两件坏事；
+// 这时直接说「X 拉取镜像失败：…」，后面那句「整批没有改动」才是重点。
+function batchFailText(b) {
+  const raw = b.error || '未知原因';
+  if (raw.startsWith('拉取镜像失败')) return `${b.failed} ${raw}`;
+  // 撞上另一把锁：镜像没拉、容器也没重建，说「X 更新失败」会让人以为 X 已经动过了。
+  // 这句话本身已经带上了是谁占着锁，原样显示比在前面再挂一个容器名更清楚。
+  if (raw.endsWith('（整批没有改动）')) return raw;
+  return `${b.failed} 更新失败：${raw}`;
+}
+
+// nodeProjectRow 一个 compose 项目一行，一个按钮更新整个项目。
+//
+// 「可用」那一格只在所有成员的目标版本一致时才写 tag —— 版本各不相同的时候
+// 挑一个写上，等于给用户一个并不存在的结论。
+function nodeProjectRow(g, node, op, batch) {
+  const members = g.members;
+  const pending = members.filter(hasUpdate);
+  const tags = [...new Set(members.map((m) => m.local_tag).filter(Boolean))];
+  const targets = [...new Set(pending.map((m) => m.latest_tag || '内容已更新'))];
+  const mine = batch && batch.project === g.project ? batch : null;
+  const runningHere = !!(mine && mine.running);
+  // 更新失败的那一行只在刚跑完那阵子留着：隔了一天的红字会让人以为刚才又失败了。
+  const fresh = mine && mine.updated_at && (Date.now() - Date.parse(mine.updated_at) < 30 * 60 * 1000);
+  const failLine = (mine && !mine.running && mine.failed && fresh)
+    ? `<div class="cell-err wrap" title="${esc(mine.error || '')}">${esc(batchFailText(mine))}</div>`
+    : '';
+  // 查不动的成员：有明确原因的（last_error），或者连状态都没查出来的（unknown）。
+  //
+  // 只数有个数是不够的 —— 「2 个容器检测异常」既不说哪两个、也不说为什么，
+  // 用户手里没有任何可动手的线索，只能看着这行红字一天天挂着。
+  const errMembers = members.filter((m) => m.last_error || m.status === 'unknown');
+  const errLine = (!failLine && errMembers.length)
+    ? errMembers.slice(0, 3).map((m) => {
+      const why = m.last_error ? shortErr(m.last_error, 110) : '这次没查出结果，状态未知';
+      return `<div class="cell-err wrap" title="${esc(m.last_error || '')}">${esc(m.container_name)}：${esc(why)}</div>`;
+    }).join('') + (errMembers.length > 3 ? `<div class="cell-err">另有 ${errMembers.length - 3} 个容器没查出结果</div>` : '')
+    : '';
+
+  // 有成员没查成功时，徽章不能写「已是最新」。
+  //
+  // 下面那行红字正说着「检测异常」，徽章却是一片绿 —— 一绿一红摆在一起，
+  // 用户根本不知道这一行到底能不能更新。缺结果就是缺结果，单独一个状态。
+  const status = pending.length
+    ? 'update_available'
+    : (errMembers.length
+      ? 'check_error'
+      : (members.every((m) => m.status === 'up_to_date') ? 'up_to_date' : members[0].status));
+  const avail = targets.length === 1 ? targets[0] : (pending.length ? `${pending.length} 项更新` : '—');
+
+  let btn = '';
+  if (runningHere) {
+    // 预拉阶段容器一个都没动，数字得说「拉了几个镜像」而不是「更新了几个容器」，
+    // 否则用户盯着 0/7 会以为卡住了。
+    const label = mine.stage === '拉取镜像'
+      ? `拉取镜像 ${mine.pulled || 0}/${mine.total}`
+      : `更新中 ${mine.done}/${mine.total}`;
+    btn = `<button class="btn small" disabled>${label}</button>`;
+  } else if (pending.length) {
+    // 失败之后按钮仍然给出来：用户看完原因下一步就是再点一次，
+    // 而批处理会跳过已经成功的那些，重试不会白跑。
+    btn = nodeProjectButton(node, g, op);
+  }
+
+  return `
+    <div class="row">
+      <div class="cell grow">
+        <div class="cell-main">${esc(g.project)}<span class="node-proj-count">${members.length} 个容器</span></div>
+        <div class="cell-sub">${members.map((m) => esc(m.container_name)).join(' · ')}</div>
+        ${failLine}${errLine}
+      </div>
+      <div class="cell col-tag">
+        <div class="cell-sub">当前</div>
+        <div class="cell-main mono">${esc(tags.length === 1 ? tags[0] : (tags.length ? '多个版本' : '—'))}</div>
+      </div>
+      <div class="cell col-tag">
+        <div class="cell-sub">可用</div>
+        <div class="cell-main mono">${esc(avail)}</div>
+      </div>
+      <div class="cell col-mode">${badge(STATUS, status)}</div>
+      <div class="cell actions">${btn}</div>
+    </div>`;
+}
+
+// nodeProjectButton 整项目的更新按钮。
+//
+// 一台机器同时只跑一个更新，所以别的容器在跑时这里一律置灰；
+// 文案保持「更新」而不是「更新中」，避免让人以为点一次把整台机器都动了。
+function nodeProjectButton(node, g, op) {
+  const running = !!op && (op.phase !== 'done' && op.phase !== 'failed');
+  const disabled = running || node.status !== 'online' || !g.members.some((m) => m.container_id);
+  return `<button class="btn small" data-node-project="${node.id}" data-project="${esc(g.project)}"
+    ${disabled ? 'disabled' : ''}>更新</button>`;
+}
+
+// nodeUpdateButton 只在「确实有更新」的行上给按钮。
+//
+// 已是最新、检测失败、已忽略的行都不给 —— 一个点了也不会有任何效果的按钮，
+// 比没有按钮更让人困惑。
+//
+// 「更新中」只贴给真正在跑的那一行。一台机器同时只跑一个更新，所以其余行
+// 一律置灰，但文案保持「更新」：它们并没有在更新，写「更新中」会让人以为
+// 点了一个按钮把整台机器的容器全动了。
+function nodeUpdateButton(c, node, op) {
+  const has = c.status === 'update_available' || c.status === 'new_version_tag';
+  if (!has || c.ignored || !c.container_id) return '';
+  const running = !!op && (op.phase !== 'done' && op.phase !== 'failed');
+  const mine = running && op.container_id === c.container_id;
+  const disabled = running || node.status !== 'online';
+  return `<button class="btn small" data-node-update="${node.id}" data-cid="${esc(c.container_id)}"
+    ${disabled ? 'disabled' : ''}>${mine ? '更新中' : '更新'}</button>`;
 }
 
 async function loadNodes() {
   const data = await api('/api/nodes');
   state.nodes = data.nodes || [];
   state.nodesOnline = data.online || 0;
+  // ops 的 key 是节点 ID 的字符串形式，取的时候用 String(n.id)，别写 n.id
+  state.nodeOps = data.ops || {};
+  state.nodeBatches = data.batches || {};
+  state.hubVersion = data.hub_version || '';
+  state.nodeUpgradable = new Set(data.upgradable || []);
+  state.nodeUpgrading = new Set(data.upgrading || []);
+  state.nodeUpgradeLast = data.upgrade_last || {};
   renderNodes();
 }
 
@@ -733,17 +1060,28 @@ async function refreshNodes(opts) {
 async function toggleNode(id) {
   if (state.nodeOpen.has(id)) {
     state.nodeOpen.delete(id);
+    state.nodeErr.delete(id);
     renderNodes();
     return;
   }
-  // 先放 null 占位，界面立刻展开并显示「正在读取」，
-  // 而不是点一下没反应、等接口回来才突然弹出来。
+  await loadNodeContainers(id);
+}
+
+// loadNodeContainers 拉一个节点的容器快照并重绘。
+//
+// 先放 null 占位，界面立刻展开并显示「正在读取」，
+// 而不是点一下没反应、等接口回来才突然弹出来。
+// 失败时把原因留在 state.nodeErr 里而不是把列表当空的渲染 ——
+// 「读不出来」和「真的没有容器」长得一样的话，用户会被引到错误的方向上去。
+async function loadNodeContainers(id) {
+  state.nodeErr.delete(id);
   state.nodeOpen.set(id, null);
   renderNodes();
   try {
     const data = await api(`/api/nodes/${id}/containers`);
     state.nodeOpen.set(id, data.containers || []);
   } catch (e) {
+    state.nodeErr.set(id, e.message);
     state.nodeOpen.set(id, []);
     toast('读取节点容器失败：' + e.message, 'danger');
   }
@@ -851,6 +1189,24 @@ async function createNode() {
   }
 }
 
+// nodeUpgrade 让一台节点把自己换成 Hub 这一版。
+//
+// 接口只等到「准备工作做完」：真正换容器是在连接断开之后发生的，
+// 所以这里说「正在升级」，之后靠轮询看版本号自己变过去。
+async function nodeUpgrade(id) {
+  const n = state.nodes.find((x) => x.id === id);
+  const name = n ? n.name : '节点';
+  try {
+    const data = await api(`/api/nodes/${id}/upgrade`, { method: 'POST' });
+    toast(data.message || `正在升级「${name}」，约 10 秒后自动回来`);
+    // Agent 会被停掉再拉起来，这段时间列表里是离线状态 —— 等它回来再刷两次。
+    setTimeout(() => refreshNodes({ quiet: true }), 8000);
+    setTimeout(() => refreshNodes({ quiet: true }), 25000);
+  } catch (e) {
+    toast('无法升级：' + e.message, 'danger');
+  }
+}
+
 async function nodeScan(id) {
   const n = state.nodes.find((x) => x.id === id);
   try {
@@ -859,6 +1215,78 @@ async function nodeScan(id) {
   } catch (e) {
     toast('无法巡检：' + e.message, 'danger');
   }
+}
+
+// nodeUpdate 在远端机器上重建一个容器。
+//
+// 接口会一直等到 Agent 回执才返回，所以这里的失败提示是准的 ——
+// 「节点不在线」「Agent 版本过旧」「已经有任务在跑」都会当场说出来，
+// 而不是让用户对着一条挂几分钟的横幅猜。
+async function nodeUpdate(nodeID, containerID) {
+  const card = state.nodes.find((x) => x.id === nodeID);
+  const name = card ? card.name : '节点';
+  try {
+    const data = await api(`/api/nodes/${nodeID}/update`, {
+      method: 'POST',
+      body: JSON.stringify({ container_id: containerID }),
+    });
+    toast(`${name}：${data.message || '已开始更新'}`);
+    // 立刻刷一次，让「正在更新」的横幅尽快出现；进度靠轮询继续追。
+    await refreshNodes({ quiet: true });
+    await refreshOpenNodeContainers(nodeID);
+  } catch (e) {
+    toast('更新失败：' + e.message, 'danger');
+  }
+}
+
+// nodeProjectUpdate 一个 compose 项目点一次，服务端依次重建里面的容器。
+//
+// 请求只等「已开始」：六个容器全跑完是十几分钟，HTTP 挂那么久会被浏览器、
+// 反代、飞牛壳各掐一次，用户看到的是「点了没反应」。进度靠轮询：
+// 节点卡片上的「更新中 2/6」与容器行状态自己会往前走。
+async function nodeProjectUpdate(nodeID, project) {
+  const card = state.nodes.find((x) => x.id === nodeID);
+  const name = card ? card.name : '节点';
+  try {
+    const data = await api(`/api/nodes/${nodeID}/update`, {
+      method: 'POST',
+      body: JSON.stringify({ compose_project: project }),
+    });
+    toast(`${name}：${data.message || '已开始更新'}（${project}）`);
+    await refreshNodes({ quiet: true });
+    await refreshOpenNodeContainers(nodeID);
+  } catch (e) {
+    toast('更新失败：' + e.message, 'danger');
+  }
+}
+
+// refreshOpenNodeContainers 重拉某个已展开节点的容器列表。
+// 更新会把整行状态换掉（待更新 → 已是最新），不重拉的话页面停在上一次的样子。
+async function refreshOpenNodeContainers(nodeID) {
+  if (!state.nodeOpen.has(nodeID)) return;
+  try {
+    const data = await api(`/api/nodes/${nodeID}/containers`);
+    state.nodeOpen.set(nodeID, data.containers || []);
+    state.nodeErr.delete(nodeID);
+    renderNodes();
+  } catch (_) { /* 下一轮轮询会再试 */ }
+}
+
+// refreshOpenNodes 把所有展开着的节点容器一起重拉。
+// 只在有操作进行中时调用，避免平白多打请求。
+async function refreshOpenNodes() {
+  const ids = [...state.nodeOpen.keys()];
+  if (!ids.length) return;
+  let changed = false;
+  await Promise.all(ids.map(async (id) => {
+    try {
+      const data = await api(`/api/nodes/${id}/containers`);
+      state.nodeOpen.set(id, data.containers || []);
+      state.nodeErr.delete(id);
+      changed = true;
+    } catch (_) { /* 忽略，下一轮再说 */ }
+  }));
+  if (changed) renderNodes();
 }
 
 async function rotateNodeToken(id) {
@@ -885,6 +1313,7 @@ async function deleteNode(id) {
   try {
     await api(`/api/nodes/${id}`, { method: 'DELETE' });
     state.nodeOpen.delete(id);
+    state.nodeErr.delete(id);
     toast('已删除');
     await loadNodes();
   } catch (e) {
@@ -1536,7 +1965,7 @@ function renderSettings() {
     <div class="field">
       <label for="health_check_wait">更新后健康检查观察窗口（秒）</label>
       <input id="health_check_wait" name="health_check_wait" type="number" min="0" max="600" value="${s.health_check_wait}">
-      <p class="field-hint">新容器启动后最多等待这么久，未通过则按下方策略处理。</p>
+      <p class="field-hint">新容器启动后至少等这么久。容器自带 HEALTHCHECK 时，会按它的探测间隔与重试次数自动延长（不短于 120 秒）；到期仍在启动的按「已启动、未确认」处理，不回滚。中途出现连续探测失败也继续观察，到期仍未恢复才回滚。</p>
     </div>
 
     <h3 class="form-section">通知渠道</h3>
@@ -1629,6 +2058,17 @@ function renderSettings() {
     </div>
     <p class="field-hint">更新动作始终由人确认：提醒消息里点「立即更新」，或在此页「容器」标签点「更新」。
       环境变量 <code>AUTO_UPDATE=true</code> 可改为发现即更新，该开关不在本页展示，保存设置不会改动它。</p>
+
+    <h3 class="form-section">远程节点</h3>
+    <label class="check">
+      <input type="checkbox" id="agent_auto_upgrade" ${s.agent_auto_upgrade ? 'checked' : ''}>
+      节点 Agent 自动跟随 Hub 升级
+    </label>
+    <p class="field-hint">
+      开着的话，Hub 升级后节点连上来时若版本落后，会自动把自己换成同一版：
+      停一次容器、按原配置重建，约 10 秒回到线上。关掉就只能在这一页手动点「升级 Agent」。
+      两版之前装的 Agent 不认识升级指令，需要在目标机上重跑一次安装命令；升上来之后就不用了。
+    </p>
 
     <h3 class="form-section">关于</h3>
     <div class="about">
@@ -2198,6 +2638,7 @@ function settingsPayload() {
     registry_mirror: $('#registry_mirror').value.trim(),
     // 自检开关每次都要带上，否则保存一次设置就把用户关掉的检查又打开了
     check_updates: $('#check_updates') ? $('#check_updates').checked : true,
+    agent_auto_upgrade: $('#agent_auto_upgrade') ? $('#agent_auto_upgrade').checked : true,
     // 这两个也是「留空即直连」，所以空串要如实回传，不能丢字段
     selfcheck_proxy: ($('#selfcheck_proxy') ? $('#selfcheck_proxy').value : '').trim(),
     selfcheck_mirror: ($('#selfcheck_mirror') ? $('#selfcheck_mirror').value : '').trim(),
@@ -2877,8 +3318,20 @@ document.addEventListener('click', async (ev) => {
   if (ev.target.closest('#btn-node-cancel')) { closeNodeForm(); return; }
   if (ev.target.closest('#btn-node-create')) { createNode(); return; }
 
+  const nUpg = ev.target.closest('[data-node-upgrade]');
+  if (nUpg) { nodeUpgrade(Number(nUpg.dataset.nodeUpgrade)); return; }
+
   const nScan = ev.target.closest('[data-node-scan]');
   if (nScan) { nodeScan(Number(nScan.dataset.nodeScan)); return; }
+
+  const nReload = ev.target.closest('[data-node-reload]');
+  if (nReload) { loadNodeContainers(Number(nReload.dataset.nodeReload)); return; }
+
+  const nUpd = ev.target.closest('[data-node-update]');
+  if (nUpd) { nodeUpdate(Number(nUpd.dataset.nodeUpdate), nUpd.dataset.cid); return; }
+
+  const nProj = ev.target.closest('[data-node-project]');
+  if (nProj) { nodeProjectUpdate(Number(nProj.dataset.nodeProject), nProj.dataset.project); return; }
 
   const nTok = ev.target.closest('[data-node-token]');
   if (nTok) { rotateNodeToken(Number(nTok.dataset.nodeToken)); return; }
@@ -2923,6 +3376,24 @@ document.addEventListener('click', async (ev) => {
     if (act === 'update') triggerUpdate(id);
     if (act === 'ignore') toggleIgnore(img);
     if (act === 'remove') removeMonitorItem(id);
+    return;
+  }
+
+  const notifDel = ev.target.closest('button[data-notif-del]');
+  if (notifDel) {
+    if (!confirm('删除这条通知？')) return;
+    api('/api/notifications/' + notifDel.dataset.notifDel, { method: 'DELETE' })
+      .then(() => { toast('已删除'); loadNotifications(); loadStats(); })
+      .catch((e) => toast('删除失败：' + e.message, 'danger'));
+    return;
+  }
+
+  const notifUp = ev.target.closest('button[data-notif-update]');
+  if (notifUp) {
+    // 判定全在服务端：真在跑就回一句「还在进行中」，不会起第二个任务。
+    api('/api/notifications/' + notifUp.dataset.notifUpdate + '/update', { method: 'POST' })
+      .then((d) => { toast(d.message || '已下发更新'); loadNotifications(); loadStats(); })
+      .catch((e) => toast('无法更新：' + e.message, 'danger'));
     return;
   }
 
@@ -3090,11 +3561,20 @@ async function pollTick() {
     idleTicks = (idleTicks + 1) % IDLE_FULL_EVERY;
     if (idleTicks === 0) await refresh({ quiet: true });
 
-    // 停在节点页、又有节点还没交过巡检结果时自己盯着点。
-    // 否则「巡检中…」会一直挂在那儿，用户只能手动点刷新才看得到结果。
-    if (state.tab === 'nodes'
-      && state.nodes.some((n) => n.status === 'online' && !hasTime(n.last_report_at))) {
-      await refreshNodes({ quiet: true });
+    // 停在节点页时自己盯着点：
+    // 1. 有节点还没交过巡检结果 —— 否则「巡检中…」会一直挂在那儿；
+    // 2. 有操作在进行（更新要几十秒到几分钟）—— 进度就靠这一轮轮询推进。
+    // 更新刚结束的那一轮也补拉一次容器，行状态才会从「待更新」翻成「已是最新」。
+    if (state.tab === 'nodes') {
+      const waiting = state.nodes.some((n) => n.status === 'online' && !hasTime(n.last_report_at));
+      const batching = Object.values(state.nodeBatches || {}).some((b) => b && b.running);
+      if (Object.keys(state.nodeOps || {}).length || waiting || batching) {
+        await refreshNodes({ quiet: true });
+      }
+      const running = Object.values(state.nodeOps || {})
+        .filter((o) => o.phase !== 'done' && o.phase !== 'failed').length;
+      if (running || lastRunningOps) await refreshOpenNodes();
+      lastRunningOps = running;
     }
   } catch (_) {
     // 网络抖一下就跳过这一轮，下一轮自己会好

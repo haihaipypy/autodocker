@@ -120,7 +120,7 @@ docker compose up -d --build
 | `WATCH` | 额外监控本机没有运行的镜像，逗号分隔，例如 `nginx:1.25,redis:7.2` |
 | `ROLLBACK_ON_FAILURE` | 更新失败是否自动回滚，默认 `true` |
 | `KEEP_OLD_CONTAINER` | 更新成功后是否保留旧容器（默认删除）。调试期建议开 |
-| `HEALTH_CHECK_WAIT` | 新容器启动后的健康检查观察窗口（秒），默认 20 |
+| `HEALTH_CHECK_WAIT` | 新容器启动后的健康检查观察窗口（秒），默认 20。容器自带 HEALTHCHECK 时按 `start_period + interval × retries` 自动延长，且不短于 120 秒，这里填的是下限。窗口内的 `unhealthy` 只算「还在启动」，到期仍未恢复才回滚 |
 | `REGISTRY_MIRROR` | Docker Hub 加速地址，可填多个、逗号分隔、按序回退，例如 `docker.1ms.run,docker.xuanyuan.me`。留空时按「守护进程 `registry-mirrors` → 内置默认」依次兜底。**只作用于 Docker Hub**，ghcr.io / quay.io / 私有仓库仍直连 |
 | `REGISTRY_AUTH` | 私有仓库凭据，形如 `docker.io=user:pass,ghcr.io=ghp_xxx` |
 | `REGISTRY_INSECURE` | 允许 http 明文注册表。`127.0.0.1` / `localhost` / `::1` 这类回环地址**不需要打开它**，会自动走 http（与 Docker 守护进程的默认规则一致）；打开后则是**所有**源都改用 http，Docker Hub 与公共加速站会因此整片失败，只在必要时刻临时开 |

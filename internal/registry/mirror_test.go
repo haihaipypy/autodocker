@@ -2,11 +2,14 @@ package registry
 
 import (
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestParseMirrors(t *testing.T) {
@@ -169,13 +172,23 @@ func TestSummarizeFailures(t *testing.T) {
 	if got := summarizeFailures([]string{"m1.io: 镜像或 tag 不存在"}, 1, 0); got != ErrNotFound {
 		t.Fatalf("全 404 应归为 ErrNotFound，实际 %v", got)
 	}
-	if got := summarizeFailures([]string{"m1.io: 拒绝访问"}, 0, 1); got != ErrUnauthorized {
+	if got := summarizeFailures([]string{"m1.io: 要求登录认证（HTTP 401）"}, 0, 1); got != ErrUnauthorized {
 		t.Fatalf("全 401 应归为 ErrUnauthorized，实际 %v", got)
 	}
 	// 一个源说不存在、另一个源超时，就不是「不存在」，而是「没查成」
 	mixed := summarizeFailures([]string{"m1.io: 镜像或 tag 不存在", "m2.io: 连接超时"}, 1, 0)
 	if mixed == ErrNotFound {
 		t.Fatalf("混合失败不应归为 ErrNotFound: %v", mixed)
+	}
+
+	// 403 的理由各家不同，必须原样带出去：压成「需要登录凭据」会把人
+	// 引去配账号，配完还是 403。这一条盯的是 1.10.4 之前的那句错话。
+	denied := summarizeFailures([]string{"m1.io: 拒绝访问（HTTP 403）：免费节点当前繁忙，请稍后重试"}, 0, 0)
+	if !strings.Contains(denied.Error(), "免费节点当前繁忙") {
+		t.Fatalf("403 的原始说明被丢掉了: %v", denied)
+	}
+	if strings.Contains(denied.Error(), "登录凭据") {
+		t.Fatalf("403 不该说成需要登录凭据: %v", denied)
 	}
 }
 
@@ -207,3 +220,69 @@ func hostOf(raw string) string {
 type errString string
 
 func (e errString) Error() string { return string(e) }
+
+// 403 的理由必须原样摘出来。
+//
+// 现场是这样的：docker.1ms.run 对 chaitin/* 的镜像层回 403 加一句
+// 「欢迎联系我们获取帮助 QQ 群」，docker.xuanyuan.me 回 403 加
+// 「免费节点当前繁忙，请稍后重试」。这句话是用户唯一能照着做的线索，
+// 统一说成「需要登录凭据」会让人去配账号，配完还是 403。
+func TestBodySnippet(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "registry 规范的 errors",
+			body: `{"errors":[{"code":"DENIED","message":"免费节点当前繁忙，请稍后重试"}]}`,
+			want: "免费节点当前繁忙",
+		},
+		{
+			name: "顶层 message",
+			body: `{"message":"需要付费通道"}`,
+			want: "需要付费通道",
+		},
+		{
+			name: "反代甩回来的 HTML",
+			body: `<html><head><title>403</title></head><body><h1>403 Forbidden</h1><p>请求过于频繁</p></body></html>`,
+			want: "请求过于频繁",
+		},
+	}
+	for _, c := range cases {
+		resp := &http.Response{Body: io.NopCloser(strings.NewReader(c.body))}
+		got := bodySnippet(resp)
+		if !strings.Contains(got, c.want) {
+			t.Errorf("%s：应摘出 %q，实际 %q", c.name, c.want, got)
+		}
+	}
+
+	// 超长要截断，而且不能把中文按字节切成半个字。
+	long := strings.Repeat("免费节点当前繁忙", 40)
+	got := bodySnippet(&http.Response{Body: io.NopCloser(strings.NewReader(long))})
+	if !utf8.ValidString(got) {
+		t.Errorf("截断后不是合法的 UTF-8：%q", got)
+	}
+	if n := len([]rune(got)); n > 121 {
+		t.Errorf("截断到 120 字以内，实际 %d 字", n)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("截断应有省略号：%q", got)
+	}
+}
+
+func TestDeniedErrorWording(t *testing.T) {
+	err := &deniedError{reason: "免费节点当前繁忙，请稍后重试"}
+	if !errors.Is(err, ErrDenied) {
+		t.Fatal("应能被 errors.Is 认成 ErrDenied")
+	}
+	if errors.Is(err, ErrUnauthorized) {
+		t.Error("403 不该被当成 401：两者要走不同的提示")
+	}
+	if got := friendlyErr(err); !strings.Contains(got, "403") || !strings.Contains(got, "免费节点当前繁忙") {
+		t.Errorf("提示要带状态码与原文，实际 %q", got)
+	}
+	if got := friendlyErr(err); strings.Contains(got, "登录") {
+		t.Errorf("403 不该说成需要登录：%q", got)
+	}
+}

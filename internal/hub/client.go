@@ -23,8 +23,12 @@ import (
 	"github.com/haihaipypy/autodocker/internal/dockerx"
 	"github.com/haihaipypy/autodocker/internal/hubproto"
 	"github.com/haihaipypy/autodocker/internal/model"
+	"github.com/haihaipypy/autodocker/internal/registry"
 	"github.com/haihaipypy/autodocker/internal/scanner"
+	"github.com/haihaipypy/autodocker/internal/selfupgrade"
 	"github.com/haihaipypy/autodocker/internal/store"
+	"github.com/haihaipypy/autodocker/internal/updater"
+	"github.com/haihaipypy/autodocker/internal/version"
 )
 
 // Config Agent 客户端配置。
@@ -34,6 +38,10 @@ type Config struct {
 	NodeName     string // 显示名，缺省用 hostname
 	Version      string // Agent 版本，用于 Hub 判断是否落后
 	ScanInterval time.Duration
+
+	// 自身容器：自动升级时要停掉、重建的就是它。
+	SelfContainer   string
+	SelfContainerID string
 
 	// 重连退避
 	ReconnectMin time.Duration
@@ -46,6 +54,7 @@ type Client struct {
 	sc   *scanner.Scanner
 	st   *store.Store
 	dk   *dockerx.Client
+	up   *updater.Updater
 	log  *slog.Logger
 	ring *Ring
 
@@ -58,11 +67,17 @@ type Client struct {
 	// 把上一轮的好数据整份覆盖掉 —— 页面上看起来像是容器全被删了。
 	scanErrMu sync.Mutex
 	scanErr   string
+
+	// 上一次自动升级的结局，只在重启后的第一份上报里带出去一次。
+	// 那一次上报本身就是「我还活着、现在是哪个版本」的证明，顺手把
+	// 升级有没有成功一起告诉 Hub，用户不用去翻目标机的 docker logs。
+	upgradeRes *hubproto.UpgradeResult
 }
 
 // New 构造客户端。ring 提供最近日志，随每次上报一起送出去；
 // 传 nil 时内部自建一个，只是没有外部引用、日志就只在本地。
-func New(cfg Config, sc *scanner.Scanner, st *store.Store, dk *dockerx.Client, logger *slog.Logger, ring *Ring) *Client {
+func New(cfg Config, sc *scanner.Scanner, st *store.Store, dk *dockerx.Client,
+	up *updater.Updater, logger *slog.Logger, ring *Ring) *Client {
 	if cfg.ReconnectMin <= 0 {
 		cfg.ReconnectMin = time.Second
 	}
@@ -75,12 +90,15 @@ func New(cfg Config, sc *scanner.Scanner, st *store.Store, dk *dockerx.Client, l
 	if ring == nil {
 		ring = NewRing(200)
 	}
-	return &Client{cfg: cfg, sc: sc, st: st, dk: dk, log: logger, ring: ring}
+	return &Client{cfg: cfg, sc: sc, st: st, dk: dk, up: up, log: logger, ring: ring}
 }
 
 // Ring 返回日志环形缓冲，交给 slog 的 MultiWriter 用，
 // 这样每次上报都能捎上最近若干行日志。
 func (c *Client) Ring() *Ring { return c.ring }
+
+// SetUpgradeResult 记下上一次自动升级的结局，随下一份上报带给 Hub。
+func (c *Client) SetUpgradeResult(res *hubproto.UpgradeResult) { c.upgradeRes = res }
 
 // Run 一直跑到 ctx 结束。内部的断线重连不向上抛错 —— 目标机可能长时间断网，
 // 那不是需要人工介入的故障。
@@ -250,9 +268,266 @@ func (c *Client) handleCmd(ctx context.Context, f hubproto.Frame) {
 			return
 		}
 		c.ack(f.ID, true, "巡检完成")
+
+	case hubproto.ActionUpdate:
+		var cmd hubproto.Cmd
+		_ = json.Unmarshal(f.Data, &cmd)
+		if cmd.ContainerID == "" {
+			c.ack(f.ID, false, "缺少容器标识")
+			return
+		}
+		if c.up == nil {
+			c.ack(f.ID, false, "这台 Agent 未启用更新能力")
+			return
+		}
+		if c.up.Busy() {
+			c.ack(f.ID, false, hubproto.ErrBusy)
+			return
+		}
+		// 先回执再动手：重建要几十秒到几分钟，回执必须立刻发出去，
+		// 否则 Hub 只能等到结束才知道这条指令到底有没有被接受。
+		// 后续进度一律走 event 帧，回执只表示「收到并开工」。
+		c.ack(f.ID, true, "已开始更新")
+		c.runUpdate(ctx, cmd)
+
+	case hubproto.ActionPull:
+		var cmd hubproto.Cmd
+		_ = json.Unmarshal(f.Data, &cmd)
+		if cmd.ContainerID == "" {
+			c.ack(f.ID, false, "缺少容器标识")
+			return
+		}
+		if c.up == nil {
+			c.ack(f.ID, false, "这台 Agent 未启用更新能力")
+			return
+		}
+		if c.up.Busy() {
+			c.ack(f.ID, false, hubproto.ErrBusy)
+			return
+		}
+		c.ack(f.ID, true, "开始拉取镜像")
+		c.runPull(ctx, cmd)
+
+	case hubproto.ActionUpgrade:
+		var cmd hubproto.Cmd
+		_ = json.Unmarshal(f.Data, &cmd)
+		selfName := c.cfg.SelfContainer
+		if selfName == "" {
+			selfName = "autodocker-agent"
+		}
+		// 回执等准备做完再发：下载新二进制、拉新镜像都可能要几十秒，
+		// 先回一句"已开始"然后失败，用户只会看到页面上的横幅转圈转到超时。
+		// 反过来，准备阶段的失败能被如实带回去 —— 那才是能照做的错误信息。
+		msg, err := selfupgrade.Prepare(ctx, c.dk, selfupgrade.Options{
+			HubURL:        c.cfg.HubURL,
+			Token:         c.cfg.Token,
+			SelfContainer: selfName,
+			SelfID:        c.cfg.SelfContainerID,
+			CurrentVer:    c.cfg.Version,
+			TargetVer:     cmd.TargetVersion,
+			ImageRef:      cmd.ImageRef,
+		}, c.log)
+		if err != nil {
+			c.ack(f.ID, false, "无法自动升级: "+err.Error())
+			return
+		}
+		c.ack(f.ID, true, msg)
+		// 从这里开始不再做任何事：几秒后 helper 会把本容器停掉。
+		// 不回 event、不去刷新状态 —— 那些都要靠一条马上就不存在的连接。
+
 	default:
 		c.ack(f.ID, false, "不支持的指令: "+f.Action)
 	}
+}
+
+// runUpdate 在目标机上重建一个容器，并把过程实时回传给 Hub。
+//
+// ctx 用的是**脱离连接**的上下文：重建过程中网络抖一下、WS 断开重连，
+// 都不能让「旧容器已停、新容器还没建」这个窗口永远停在那里。
+// 断线只影响进度能不能送出去，不影响更新本身要不要跑完。
+func (c *Client) runUpdate(parent context.Context, cmd hubproto.Cmd) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 45*time.Minute)
+	defer cancel()
+
+	name := cmd.ContainerName
+	imageRef, target := c.updateTarget(cmd.ContainerID, cmd.ContainerName)
+	if name == "" {
+		name = shortID(cmd.ContainerID)
+	}
+	if imageRef == "" {
+		imageRef = cmd.ImageRef
+	}
+
+	taskID, err := c.st.CreateTask(&model.Task{
+		ImageRef:      imageRef,
+		ContainerID:   cmd.ContainerID,
+		ContainerName: name,
+		TriggeredBy:   "hub",
+	})
+	if err != nil {
+		c.log.Error("创建更新任务失败", "container", name, "err", err)
+		return
+	}
+
+	opID := fmt.Sprintf("u-%d", time.Now().UnixNano())
+	emit := func(phase, msg string) {
+		// 进度帧丢了不影响正确性：最终状态由更新结束后那次全量上报兜底。
+		if err := c.send(hubproto.TypeEvent, "", hubproto.Event{
+			OpID:          opID,
+			Kind:          "update",
+			Phase:         phase,
+			ContainerID:   cmd.ContainerID,
+			ContainerName: name,
+			Message:       msg,
+			TaskID:        taskID,
+			At:            hubproto.Now(),
+		}); err != nil {
+			c.log.Debug("进度回传失败", "op", opID, "err", err)
+		}
+	}
+
+	c.log.Info("收到更新指令", "container", name, "image", imageRef, "target", target, "task", taskID)
+	emit(hubproto.PhaseStart, "开始更新 "+name)
+
+	// 节流：拉镜像阶段 Docker 会刷出大量层进度，逐条转发会把 WS 打满，
+	// 也会让 Hub 侧的状态更新抢在同一毫秒里。同一秒只发一条即可。
+	var lastSent time.Time
+	err = c.up.Run(ctx, updater.Request{
+		TaskID:        taskID,
+		ImageRef:      target,
+		ContainerID:   cmd.ContainerID,
+		ContainerName: name,
+		TriggeredBy:   "hub",
+		OnProgress: func(line string) {
+			if time.Since(lastSent) < 900*time.Millisecond {
+				return
+			}
+			lastSent = time.Now()
+			emit(hubproto.PhaseProgress, line)
+		},
+	})
+
+	if err != nil {
+		c.log.Warn("远端更新失败", "container", name, "err", err)
+		emit(hubproto.PhaseFailed, err.Error())
+	} else {
+		c.log.Info("远端更新完成", "container", name)
+		emit(hubproto.PhaseDone, "更新完成")
+	}
+
+	// 无论成败都补一次全量上报：成功时行状态要变成「已是最新」，
+	// 失败时容器可能已被回滚或停在半路，页面必须看到真实情况。
+	if rerr := c.report(ctx); rerr != nil {
+		c.log.Warn("更新后上报失败", "err", rerr)
+	}
+}
+
+// runPull 只把镜像拉到目标机，不碰任何容器。
+//
+// 批量更新的第一步：整个项目的镜像先全部拉齐，任何一个拉不到就整批不动。
+// 以前是「拉一个建一个」，第一个成员拉到一半失败时，前面的容器已经换成新版了，
+// 一个 compose 项目就这样停在新旧混搭的状态上 —— 比不更新更难收拾。
+func (c *Client) runPull(parent context.Context, cmd hubproto.Cmd) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Minute)
+	defer cancel()
+
+	name := cmd.ContainerName
+	imageRef, target := c.updateTarget(cmd.ContainerID, cmd.ContainerName)
+	if name == "" {
+		name = shortID(cmd.ContainerID)
+	}
+	if imageRef == "" {
+		imageRef = cmd.ImageRef
+	}
+	if target == "" {
+		// 本地库还没有这个容器的记录（刚创建、还没巡检到），拿 Hub 给的引用兜底。
+		target = cmd.ImageRef
+	}
+	if target == "" {
+		c.log.Warn("预拉缺少目标引用，已跳过", "container", name)
+		return
+	}
+
+	taskID, err := c.st.CreateTask(&model.Task{
+		ImageRef:      imageRef,
+		ContainerID:   cmd.ContainerID,
+		ContainerName: name,
+		TriggeredBy:   "hub",
+	})
+	if err != nil {
+		c.log.Error("创建拉取任务失败", "container", name, "err", err)
+		return
+	}
+
+	opID := fmt.Sprintf("p-%d", time.Now().UnixNano())
+	emit := func(phase, msg string) {
+		if err := c.send(hubproto.TypeEvent, "", hubproto.Event{
+			OpID:          opID,
+			Kind:          "pull",
+			Phase:         phase,
+			ContainerID:   cmd.ContainerID,
+			ContainerName: name,
+			Message:       msg,
+			TaskID:        taskID,
+			At:            hubproto.Now(),
+		}); err != nil {
+			c.log.Debug("拉取进度回传失败", "op", opID, "err", err)
+		}
+	}
+
+	c.log.Info("收到预拉指令", "container", name, "image", imageRef, "target", target, "task", taskID)
+	emit(hubproto.PhaseStart, "开始拉取镜像 "+target)
+
+	// 与更新走同一套节流：Docker 拉镜像时会按层刷大量进度行。
+	var lastSent time.Time
+	err = c.up.Pull(ctx, updater.PullRequest{
+		TaskID:   taskID,
+		ImageRef: target,
+		Preload:  true,
+		OnProgress: func(line string) {
+			if time.Since(lastSent) < 900*time.Millisecond {
+				return
+			}
+			lastSent = time.Now()
+			emit(hubproto.PhaseProgress, line)
+		},
+	})
+	if err != nil {
+		c.log.Warn("预拉失败", "container", name, "err", err)
+		emit(hubproto.PhaseFailed, err.Error())
+		return
+	}
+	c.log.Info("预拉完成", "container", name, "target", target)
+	emit(hubproto.PhaseDone, "镜像已就绪")
+}
+
+// updateTarget 从本地库推导这次要拉的目标引用。
+//
+// 判定留在 Agent 上 —— Hub 只转发「重建哪个容器」，不参与算版本。
+// 升 tag 的场景（v3.6.0 → v3.7.0）要拉新 tag，同 tag 换内容的场景
+// （latest 摘要变了）拉原引用。这个区别只有本地这份巡检结果知道。
+//
+// 编号查不到时按容器名再找一次：容器被重建过（compose 重建、外部升级）之后，
+// Hub 手上的编号可能已经换成新的，而本地这份记录还没被下一轮巡检刷过来。
+// 只认编号会推不出引用，最后拿空字符串去拉镜像 —— 报错还看不出是这一步。
+func (c *Client) updateTarget(containerID, containerName string) (imageRef, target string) {
+	img, err := c.st.FindImageByContainer(containerID)
+	if (err != nil || img == nil) && containerName != "" {
+		img, err = c.st.FindImageByContainerName(containerName)
+	}
+	if err != nil || img == nil {
+		return "", ""
+	}
+	imageRef = img.Reference
+	target = img.Reference
+	if img.LatestTag == "" {
+		return imageRef, target
+	}
+	ref, perr := registry.ParseReference(img.Reference)
+	if perr != nil || version.Compare(img.LatestTag, ref.Tag) <= 0 {
+		return imageRef, target
+	}
+	return imageRef, ref.WithTag(img.LatestTag)
 }
 
 func (c *Client) ack(id string, ok bool, msg string) {
@@ -321,21 +596,24 @@ func (c *Client) report(ctx context.Context) error {
 			continue
 		}
 		list = append(list, hubproto.Container{
-			ContainerID:   img.ContainerID,
-			ContainerName: img.ContainerName,
-			ImageRef:      img.Reference,
-			ImageID:       img.ImageID,
-			LocalTag:      img.LocalTag,
-			LocalDigest:   img.LocalDigest,
-			RemoteDigest:  img.RemoteDigest,
-			LatestTag:     img.LatestTag,
-			Aliases:       img.Aliases,
-			Origin:        string(img.Origin),
-			Status:        string(img.Status),
-			Mode:          string(img.Mode),
-			Ignored:       img.Ignored,
-			LastError:     img.LastError,
-			CheckedAt:     checkedAt(img),
+			ContainerID:    img.ContainerID,
+			ContainerName:  img.ContainerName,
+			ComposeProject: img.ComposeProject,
+			ComposeService: img.ComposeService,
+			ComposeDeps:    img.ComposeDeps,
+			ImageRef:       img.Reference,
+			ImageID:        img.ImageID,
+			LocalTag:       img.LocalTag,
+			LocalDigest:    img.LocalDigest,
+			RemoteDigest:   img.RemoteDigest,
+			LatestTag:      img.LatestTag,
+			Aliases:        img.Aliases,
+			Origin:         string(img.Origin),
+			Status:         string(img.Status),
+			Mode:           string(img.Mode),
+			Ignored:        img.Ignored,
+			LastError:      img.LastError,
+			CheckedAt:      checkedAt(img),
 		})
 	}
 
@@ -344,6 +622,11 @@ func (c *Client) report(ctx context.Context) error {
 		Containers: list,
 		Logs:       c.ring.Tail(120),
 		ScanError:  c.lastScanErr(),
+	}
+	// 升级结局只带一次：带完就清掉，否则之后每轮上报都在说同一件旧事。
+	if c.upgradeRes != nil {
+		rep.Upgrade = c.upgradeRes
+		c.upgradeRes = nil
 	}
 	if err := c.send(hubproto.TypeReport, "", rep); err != nil {
 		return err

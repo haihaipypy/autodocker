@@ -1,6 +1,7 @@
 package feishu
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -256,5 +257,39 @@ func findButtons(v any, out *[]map[string]any) {
 		for _, child := range t {
 			findButtons(child, out)
 		}
+	}
+}
+
+// 远端提醒必须把节点名列出来，而且要带上颜色；本机提醒不能凭空多出这一行。
+//
+// 手机上几条提醒连着弹，只靠标题里那串小字分不清是哪台机器，
+// 这条断言就是把「节点单独一行 + 染色」钉住。
+func TestBuildUpdateCardShowsNodeName(t *testing.T) {
+	// 不用 json.Marshal：它会把 <font> 转成 \u003c，断言就看不出颜色了。
+	render := func(n *model.Notification) string {
+		var buf bytes.Buffer
+		enc := json.NewEncoder(&buf)
+		enc.SetEscapeHTML(false)
+		if err := enc.Encode(BuildUpdateCard(n)); err != nil {
+			t.Fatal(err)
+		}
+		return buf.String()
+	}
+
+	n := sampleNotification()
+	n.NodeName = "1panel"
+	n.Title = "🖥️ 1panel · joplin 有新版本可用"
+
+	card := render(n)
+	if !strings.Contains(card, "**节点**：<font color='orange'>1panel</font>") {
+		t.Errorf("节点那一行没染色或没渲染: %s", card)
+	}
+	if !strings.Contains(card, "🖥️ 1panel") {
+		t.Errorf("标题里应带节点名与符号: %s", card)
+	}
+
+	n.NodeName = ""
+	if strings.Contains(render(n), "节点") {
+		t.Error("本机提醒不该出现「节点」那一行")
 	}
 }

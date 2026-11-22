@@ -149,7 +149,13 @@ func BuildUpdateCard(n *model.Notification, taskID string) TemplateCard {
 		name = "（无关联容器）"
 	}
 
-	items := []Item{{Keyname: "容器", Value: clip(name, maxItemValue)}}
+	items := make([]Item, 0, 4)
+	// 节点单独占一行放在最上面：企业微信卡片里字段行是带底色的块，
+	// 比标题里那串小字显眼得多。
+	if n.NodeName != "" {
+		items = append(items, Item{Keyname: "节点", Value: clip(n.NodeName, maxItemValue)})
+	}
+	items = append(items, Item{Keyname: "容器", Value: clip(name, maxItemValue)})
 	if n.Kind == model.NotifNewTag && n.LatestTag != "" {
 		items = append(items,
 			Item{Keyname: "镜像", Value: clip(n.ImageRef, maxItemValue)},
@@ -185,16 +191,22 @@ func BuildUpdateCard(n *model.Notification, taskID string) TemplateCard {
 func BuildStateCard(n *model.Notification, taskID string, state model.CardState, detail string) TemplateCard {
 	title, desc, color := statusOf(state)
 
+	items := make([]Item, 0, 4)
+	if n.NodeName != "" {
+		items = append(items, Item{Keyname: "节点", Value: clip(n.NodeName, maxItemValue)})
+	}
+	items = append(items,
+		Item{Keyname: "容器", Value: clip(orFallback(n.ContainerName, n.ImageRef), maxItemValue)},
+		Item{Keyname: "镜像", Value: clip(n.ImageRef, maxItemValue)},
+		Item{Keyname: "状态", Value: clip(title, maxItemValue)},
+	)
+
 	return TemplateCard{
-		CardType:     "button_interaction",
-		TaskID:       taskID,
-		MainTitle:    &Title{Title: clip(title, maxTitleLen), Desc: clip(desc, maxDescLen)},
-		SubTitleText: clip(orDash(detail), maxSubTitle),
-		ContentList: []Item{
-			{Keyname: "容器", Value: clip(orFallback(n.ContainerName, n.ImageRef), maxItemValue)},
-			{Keyname: "镜像", Value: clip(n.ImageRef, maxItemValue)},
-			{Keyname: "状态", Value: clip(title, maxItemValue)},
-		},
+		CardType:      "button_interaction",
+		TaskID:        taskID,
+		MainTitle:     &Title{Title: clip(title, maxTitleLen), Desc: clip(desc, maxDescLen)},
+		SubTitleText:  clip(orDash(detail), maxSubTitle),
+		ContentList:   items,
 		EmphasisTitle: &Emph{Title: clip(title, 10), Desc: clip(color, 15)},
 	}
 }
@@ -277,6 +289,9 @@ func BuildDoneMessage(n *model.Notification, state model.CardState, detail strin
 	name := orFallback(n.ContainerName, n.ImageRef)
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s **%s**\n", icon, title)
+	if n.NodeName != "" {
+		fmt.Fprintf(&b, "> 节点：%s\n", n.NodeName)
+	}
 	fmt.Fprintf(&b, "> 容器：%s\n", name)
 	fmt.Fprintf(&b, "> 镜像：%s\n\n", n.ImageRef)
 	b.WriteString(orDash(detail))

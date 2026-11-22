@@ -132,6 +132,9 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/notifications", s.handleListNotifications)
 	mux.HandleFunc("POST /api/notifications/{id}/read", s.handleReadNotification)
+	// 在网页上直接对一条提醒执行更新（待处理 / 卡在更新中的都能点）。
+	mux.HandleFunc("POST /api/notifications/{id}/update", s.handleNotificationUpdate)
+	mux.HandleFunc("DELETE /api/notifications/{id}", s.handleDeleteNotification)
 	mux.HandleFunc("POST /api/notifications/read-all", s.handleReadAll)
 	mux.HandleFunc("DELETE /api/notifications/read", s.handleClearRead)
 
@@ -187,6 +190,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/nodes/{id}", s.handleDeleteNode)
 	mux.HandleFunc("POST /api/nodes/{id}/token", s.handleRotateNodeToken)
 	mux.HandleFunc("POST /api/nodes/{id}/scan", s.handleNodeScan)
+	mux.HandleFunc("POST /api/nodes/{id}/update", s.handleNodeUpdate)
+	// 让节点把自己换成 Hub 这一版（1.8.4 起）。
+	mux.HandleFunc("POST /api/nodes/{id}/upgrade", s.handleNodeUpgrade)
 	mux.HandleFunc("GET /api/nodes/{id}/containers", s.handleNodeContainers)
 	// 所有节点的容器快照，供列表页的「全部节点」视图用
 	mux.HandleFunc("GET /api/node-containers", s.handleAllNodeContainers)

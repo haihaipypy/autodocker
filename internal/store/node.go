@@ -103,6 +103,26 @@ func (s *Store) ListNodes() ([]model.Node, error) {
 	return out, rows.Err()
 }
 
+// NodeUpdateTotals 汇总所有节点快照里「可更新」的容器数。
+//
+// 口径与节点卡片上的 update_count 完全一致（容器维度、两种更新状态都算），
+// 这样首页那个数字跟节点页每张卡上的「待更新 N」加得起来 —— 两边对不上时，
+// 看的人会先怀疑自己数错了，然后不再相信任何一个数字。
+//
+// 离线节点的快照也计入：那是它最后一次上报时确实还欠着更新的数量，
+// 排除掉只会让首页数字在节点掉线时莫名其妙变小，看着像更新自己消失了。
+func (s *Store) NodeUpdateTotals() (containers, updates int, err error) {
+	err = s.db.QueryRow(
+		`SELECT
+			(SELECT COUNT(*) FROM node_containers
+			  WHERE origin = 'container'),
+			(SELECT COUNT(*) FROM node_containers
+			  WHERE origin = 'container'
+			    AND status IN ('update_available', 'new_version_tag'))`,
+	).Scan(&containers, &updates)
+	return containers, updates, err
+}
+
 // GetNode 按 ID 查节点。
 func (s *Store) GetNode(id int64) (*model.Node, error) {
 	row := s.db.QueryRow(`SELECT `+nodeCols+` FROM nodes WHERE id = ?`, id)
@@ -231,10 +251,11 @@ func (s *Store) ReplaceNodeContainers(nodeID int64, list []model.NodeContainer) 
 	}
 	stmt, err := tx.Prepare(
 		`INSERT INTO node_containers
-			(node_id, container_id, container_name, image_ref, image_id,
+			(node_id, container_id, container_name, compose_project, compose_service, compose_deps,
+			 image_ref, image_id,
 			 local_tag, local_digest, remote_digest, latest_tag, aliases,
 			 origin, status, mode, ignored, last_error, checked_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		return err
@@ -247,8 +268,17 @@ func (s *Store) ReplaceNodeContainers(nodeID int64, list []model.NodeContainer) 
 			b, _ := json.Marshal(c.Aliases)
 			aliases = string(b)
 		}
+		// 依赖列表存 JSON 数组而不是逗号拼接：服务名里理论上不会有逗号，
+		// 但空列表与「一个空字符串」在拼接下长得一样，JSON 不会。
+		deps := "[]"
+		if len(c.ComposeDeps) > 0 {
+			if b, err := json.Marshal(c.ComposeDeps); err == nil {
+				deps = string(b)
+			}
+		}
 		if _, err := stmt.Exec(
-			nodeID, c.ContainerID, c.ContainerName, c.ImageRef, c.ImageID,
+			nodeID, c.ContainerID, c.ContainerName, c.ComposeProject, c.ComposeService, deps,
+			c.ImageRef, c.ImageID,
 			c.LocalTag, c.LocalDigest, c.RemoteDigest, c.LatestTag, aliases,
 			c.Origin, c.Status, c.Mode, b2i(c.Ignored), c.LastError, timeToTs(c.CheckedAt),
 		); err != nil {
@@ -259,9 +289,10 @@ func (s *Store) ReplaceNodeContainers(nodeID int64, list []model.NodeContainer) 
 }
 
 // ListNodeContainers 读某个节点的快照。
+// ListNodeContainers 读某台机器的全部容器快照。
 func (s *Store) ListNodeContainers(nodeID int64) ([]model.NodeContainer, error) {
 	rows, err := s.db.Query(
-		`SELECT node_id, container_id, container_name, image_ref, image_id,
+		`SELECT node_id, container_id, container_name, compose_project, compose_service, compose_deps, image_ref, image_id,
 			local_tag, local_digest, remote_digest, latest_tag, aliases,
 			origin, status, mode, ignored, last_error, checked_at
 		 FROM node_containers WHERE node_id = ? ORDER BY container_name`,
@@ -274,13 +305,73 @@ func (s *Store) ListNodeContainers(nodeID int64) ([]model.NodeContainer, error) 
 	return scanNodeContainers(rows)
 }
 
+// FindNodeContainer 取某台机器上一个容器的快照。
+//
+// 卡片上点「更新」时只有通知里的容器编号，要拼出下发的指令（容器名、镜像引用）
+// 得回到快照里查一次。查不到返回 ErrNotFound —— 那说明容器已经被删掉了，
+// 这时候什么都别做比发一条注定失败的指令更好。
+func (s *Store) FindNodeContainer(nodeID int64, containerID string) (*model.NodeContainer, error) {
+	return s.findNodeContainer(`node_id = ? AND container_id = ?`, nodeID, containerID)
+}
+
+// FindNodeContainerByName 按容器名在这台机器的快照里找。
+//
+// 容器编号只在「这一个容器实例」的生命周期里有效：compose 重建、外部升级、
+// 甚至一次失败的更新回滚，都可能让编号变掉，而提醒里存的是发提醒那一刻的编号。
+// 编号对不上时按名字再找一次 —— 名字是用户在页面上真正认得的东西，重建时也保留。
+func (s *Store) FindNodeContainerByName(nodeID int64, name string) (*model.NodeContainer, error) {
+	if name == "" {
+		return nil, ErrNotFound
+	}
+	return s.findNodeContainer(`node_id = ? AND container_name = ?`, nodeID, name)
+}
+
+func (s *Store) findNodeContainer(where string, args ...any) (*model.NodeContainer, error) {
+	row := s.db.QueryRow(
+		`SELECT node_id, container_id, container_name, compose_project, compose_service, compose_deps, image_ref, image_id,
+			local_tag, local_digest, remote_digest, latest_tag, aliases,
+			origin, status, mode, ignored, last_error, checked_at
+		 FROM node_containers WHERE `+where+` LIMIT 1`,
+		args...,
+	)
+	var (
+		c         model.NodeContainer
+		aliases   string
+		depsJSON  string
+		ignored   int
+		checkedAt int64
+	)
+	err := row.Scan(
+		&c.NodeID, &c.ContainerID, &c.ContainerName, &c.ComposeProject, &c.ComposeService, &depsJSON,
+		&c.ImageRef, &c.ImageID,
+		&c.LocalTag, &c.LocalDigest, &c.RemoteDigest, &c.LatestTag, &aliases,
+		&c.Origin, &c.Status, &c.Mode, &ignored, &c.LastError, &checkedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.Ignored = ignored != 0
+	c.CheckedAt = tsToTime(checkedAt)
+	if aliases != "" {
+		_ = json.Unmarshal([]byte(aliases), &c.Aliases)
+	}
+	if depsJSON != "" {
+		_ = json.Unmarshal([]byte(depsJSON), &c.ComposeDeps)
+	}
+	return &c, nil
+}
+
 // ListAllNodeContainers 读所有节点的快照，附带节点名。
 //
 // 列表页的「全部节点」视图就靠它。节点被删掉时快照会一起删（见 DeleteNode），
 // 这里仍然用 JOIN 而不是拼内存，避免出现孤儿行。
 func (s *Store) ListAllNodeContainers() ([]model.NodeContainerView, error) {
 	rows, err := s.db.Query(
-		`SELECT c.node_id, c.container_id, c.container_name, c.image_ref, c.image_id,
+		`SELECT c.node_id, c.container_id, c.container_name, c.compose_project,
+			c.compose_service, c.compose_deps, c.image_ref, c.image_id,
 			c.local_tag, c.local_digest, c.remote_digest, c.latest_tag, c.aliases,
 			c.origin, c.status, c.mode, c.ignored, c.last_error, c.checked_at,
 			n.name
@@ -298,12 +389,14 @@ func (s *Store) ListAllNodeContainers() ([]model.NodeContainerView, error) {
 		var (
 			c         model.NodeContainer
 			aliases   string
+			depsJSON  string
 			ignored   int
 			checkedAt int64
 			nodeName  string
 		)
 		if err := rows.Scan(
-			&c.NodeID, &c.ContainerID, &c.ContainerName, &c.ImageRef, &c.ImageID,
+			&c.NodeID, &c.ContainerID, &c.ContainerName, &c.ComposeProject, &c.ComposeService, &depsJSON,
+			&c.ImageRef, &c.ImageID,
 			&c.LocalTag, &c.LocalDigest, &c.RemoteDigest, &c.LatestTag, &aliases,
 			&c.Origin, &c.Status, &c.Mode, &ignored, &c.LastError, &checkedAt,
 			&nodeName,
@@ -314,6 +407,9 @@ func (s *Store) ListAllNodeContainers() ([]model.NodeContainerView, error) {
 		c.CheckedAt = tsToTime(checkedAt)
 		if aliases != "" {
 			_ = json.Unmarshal([]byte(aliases), &c.Aliases)
+		}
+		if depsJSON != "" {
+			_ = json.Unmarshal([]byte(depsJSON), &c.ComposeDeps)
 		}
 		out = append(out, model.NodeContainerView{NodeContainer: c, NodeName: nodeName})
 	}
@@ -326,11 +422,13 @@ func scanNodeContainers(rows *sql.Rows) ([]model.NodeContainer, error) {
 		var (
 			c         model.NodeContainer
 			aliases   string
+			depsJSON  string
 			ignored   int
 			checkedAt int64
 		)
 		if err := rows.Scan(
-			&c.NodeID, &c.ContainerID, &c.ContainerName, &c.ImageRef, &c.ImageID,
+			&c.NodeID, &c.ContainerID, &c.ContainerName, &c.ComposeProject, &c.ComposeService, &depsJSON,
+			&c.ImageRef, &c.ImageID,
 			&c.LocalTag, &c.LocalDigest, &c.RemoteDigest, &c.LatestTag, &aliases,
 			&c.Origin, &c.Status, &c.Mode, &ignored, &c.LastError, &checkedAt,
 		); err != nil {
@@ -340,6 +438,9 @@ func scanNodeContainers(rows *sql.Rows) ([]model.NodeContainer, error) {
 		c.CheckedAt = tsToTime(checkedAt)
 		if aliases != "" {
 			_ = json.Unmarshal([]byte(aliases), &c.Aliases)
+		}
+		if depsJSON != "" {
+			_ = json.Unmarshal([]byte(depsJSON), &c.ComposeDeps)
 		}
 		out = append(out, c)
 	}

@@ -457,7 +457,39 @@ main { padding: 20px 24px 48px; }
 .cell.narrow { flex: 0 0 56px; }
 .cell.center { text-align: center; }
 .cell.actions { display: flex; gap: 6px; flex: 0 0 158px; justify-content: flex-end; }
+/* 通知那一排有三个动作（更新 / 已读 / 删除），固定宽度会把按钮挤成一团 */
+.notif-row .cell.actions { flex: 0 0 auto; }
 .cell.actions .btn { opacity: .75; }
+
+/* 合并提醒的成员清单：一行一个容器，名字后面挂状态。
+   允许换行 —— 一个 compose 项目七八个服务是常态，挤成一行会看不全。 */
+.notif-members {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 4px;
+}
+.notif-member {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-sub);
+}
+.notif-member .badge { font-size: 10.5px; padding: 1px 6px; }
+
+/* 通知行里的失败原因。允许折行：Agent 的报错往往带着镜像名与 HTTP 状态码，
+   截成一行就看不全；用强调色是因为它是这一行唯一需要照着动手的信息。 */
+.notif-detail {
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--danger);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* 老记录没有存原因，那句「点重试更新」只是提示，不用威胁色。 */
+.notif-detail.dim { color: var(--text-sub); }
 
 /* 固定列宽 —— 列的位置不能随内容长短左右浮动。
    早先用的是「内容决定宽度」，于是同一页里逐行读下来，
@@ -537,6 +569,15 @@ main { padding: 20px 24px 48px; }
   text-overflow: ellipsis;
 }
 
+/* 整批更新停在哪一个、为什么停 —— 这句话比行高重要，允许换行显示全。
+   单行省略的那套本来是为了不把列表撑开，但这里省略掉的正是要看的部分。 */
+.cell-err.wrap {
+  white-space: normal;
+  overflow: visible;
+  line-height: 1.6;
+  word-break: break-all;
+}
+
 .cell-main {
   font-size: 13px;
   white-space: nowrap;
@@ -574,6 +615,14 @@ main { padding: 20px 24px 48px; }
 .badge.info { background: var(--info-soft); color: var(--info); border-color: var(--border); }
 .badge.danger { background: var(--danger-soft); color: var(--danger); border-color: var(--border); }
 
+/* compose 项目行上那句「6 个容器」：跟着项目名后面，不能抢它的视觉重量。 */
+.node-proj-count {
+  margin-left: 8px;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--text-sub);
+}
+
 .dot {
   display: inline-block;
   width: 7px; height: 7px;
@@ -589,6 +638,21 @@ main { padding: 20px 24px 48px; }
   text-align: center;
   color: var(--text-sub);
   font-size: 13px;
+}
+
+/* 节点容器读不出来。刻意不用 .empty 的灰色小字：
+   这里不是「没有容器」，是「没读到」，得让人一眼看出是出错了。 */
+.node-load-err {
+  padding: 22px 20px;
+  text-align: center;
+  color: var(--danger);
+  font-size: 12.5px;
+  line-height: 1.7;
+  word-break: break-all;
+}
+.node-load-err .btn {
+  display: block;
+  margin: 10px auto 0;
 }
 
 /* ---------- 表单 ---------- */
@@ -1387,6 +1451,48 @@ button.pill:hover { filter: brightness(1.12); }
 .node-head .cell.actions { flex: 0 0 auto; }
 .node-head .cell.actions .btn { opacity: .75; }
 .node-head:hover .cell.actions .btn { opacity: 1; }
+
+/* 进行中的操作横幅。夹在卡片头和展开区之间 —— 有它才看得出「点了有反应」。
+   不做百分比进度条：拉镜像的层进度对用户没有意义，99% 卡十分钟是常态。 */
+.node-op {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  font-size: 12.5px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+.node-op.busy { color: var(--info); }
+.node-op.ok { color: var(--ok); }
+.node-op.danger { color: var(--danger); }
+
+.node-op-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.node-op.busy .node-op-dot { animation: node-op-pulse 1.4s ease-in-out infinite; }
+
+.node-op-msg {
+  margin-left: 4px;
+  color: var(--text-sub);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes node-op-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .35; transform: scale(.82); }
+}
+
+/* 节点容器行里只有一个「更新」按钮，用不着 158px 那么宽 */
+.node-containers .cell.actions { flex: 0 0 76px; }
 
 .node-detail {
   border-top: 1px solid var(--border);

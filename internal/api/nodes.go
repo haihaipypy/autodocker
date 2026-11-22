@@ -36,7 +36,22 @@ func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {
 	if nodes == nil {
 		nodes = []model.Node{}
 	}
-	writeOK(w, map[string]any{"nodes": nodes, "online": s.hub.OnlineCount()})
+	// ops 是「此刻哪台机器在更新」的瞬时状态，key 是节点 ID。
+	// 放在列表接口里一起带出去，前端不用为它再发一轮请求。
+	//
+	// upgradable / upgrading / upgrade_last 是同一类东西：升级的进行状态
+	// 也只在内存里（升级会把 Agent 停掉，没有任何连接能记录中间过程），
+	// 让前端一次拿全，避免为每张节点卡再发请求。
+	writeOK(w, map[string]any{
+		"nodes":        nodes,
+		"online":       s.hub.OnlineCount(),
+		"ops":          s.hub.Ops(),
+		"batches":      s.hub.Batches(),
+		"hub_version":  selfcheck.Version,
+		"upgradable":   s.hub.Upgradable(),
+		"upgrading":    s.hub.UpgradingIDs(),
+		"upgrade_last": s.hub.LastUpgrades(),
+	})
 }
 
 type createNodeReq struct {
@@ -179,6 +194,175 @@ func (s *Server) handleNodeScan(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]any{"ok": true})
 }
 
+type nodeUpdateReq struct {
+	ContainerID string `json:"container_id"`
+	// ComposeProject 传了就不看 ContainerID：点的是「这个项目」，
+	// 服务端自己回快照里挑出该项目下所有待更新的容器，依次重建。
+	//
+	// 让前端把成员列表一起传上来也能做，但页面可能已经开了几分钟，
+	// 中间有容器被删、被忽略、被更新过 —— 以 Hub 手上这份快照为准才不会跑空。
+	ComposeProject string `json:"compose_project"`
+}
+
+// handleNodeUpdate 让某个节点重建一个容器。
+//
+// 只传 container_id，不传目标镜像：拉哪个 tag 由 Agent 用自己那份巡检结果推导。
+// Hub 手上这份快照本来就来自 Agent，再算一遍只是多一处可能算错的地方，
+// 也违背「判定留在 Agent」这条贯穿整个远端设计的原则。
+//
+// 这里等回执（SendWait）而不是发完就走：1.7.5 的 Agent 不认识 update，
+// 它会 ack 一句「不支持的指令」—— 用户当场就知道该去目标机重跑安装命令，
+// 而不是对着一条挂几分钟的「更新中」横幅猜。
+func (s *Server) handleNodeUpdate(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var req nodeUpdateReq
+	if err := decodeBody(r, &req); err != nil {
+		writeErr(w, http.StatusBadRequest, "参数解析失败: "+err.Error())
+		return
+	}
+	if project := strings.TrimSpace(req.ComposeProject); project != "" {
+		s.handleNodeUpdateProject(w, id, project)
+		return
+	}
+	req.ContainerID = strings.TrimSpace(req.ContainerID)
+	if req.ContainerID == "" {
+		writeErr(w, http.StatusBadRequest, "缺少容器编号")
+		return
+	}
+
+	// 以 Hub 上的快照为准，不信前端传来的镜像名：
+	// 页面可能开着好几分钟，中间容器已经被换掉了。
+	list, err := s.st.ListNodeContainers(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "读取节点快照失败: "+err.Error())
+		return
+	}
+	var item *model.NodeContainer
+	for i := range list {
+		if list[i].ContainerID == req.ContainerID {
+			item = &list[i]
+			break
+		}
+	}
+	if item == nil {
+		writeErr(w, http.StatusNotFound, "这台机器上没有这个容器，刷新一下节点再看")
+		return
+	}
+	if item.Ignored {
+		writeErr(w, http.StatusConflict, "这个容器已被忽略，先恢复监控再更新")
+		return
+	}
+	if item.Status != model.StatusUpdatePending && item.Status != model.StatusNewTag {
+		writeErr(w, http.StatusConflict, "这个容器当前没有可用的更新")
+		return
+	}
+
+	if op := s.hub.Op(id); op != nil && op.Phase != hubproto.PhaseDone && op.Phase != hubproto.PhaseFailed {
+		who := op.ContainerName
+		if who == "" {
+			who = "另一个容器"
+		}
+		writeErr(w, http.StatusConflict, "这台机器正在更新 "+who+"，等它跑完再试")
+		return
+	}
+	// 批量刚点下去的头几秒里 Op 还是空的（第一个事件还没回来），
+	// 只看 Op 挡不住插队。
+	if s.hub.BatchBusy(id) {
+		writeErr(w, http.StatusConflict, "这台机器正在依次更新一个项目，等它跑完再试")
+		return
+	}
+
+	// 指令的拼装统一在 hubserver.UpdateContainer 里 —— 卡片按钮也走同一个入口。
+	// 否则两条路各拼一次，迟早出现「网页能更、卡片点不动」这种一半好一半坏的状态。
+	msg, _, err := s.hub.UpdateContainer(id, req.ContainerID, item.ContainerName)
+	if err != nil {
+		text := err.Error()
+		// 「不支持的指令」是 Agent 侧 handleCmd 的 default 分支固定文案。
+		// 撞上它说明那台机器上跑的还是没有 update 能力的旧 Agent，
+		// 原样抛给用户没有可操作性，换成一句能照做的。
+		if strings.Contains(text, "不支持的指令") {
+			ver := ""
+			if n, gerr := s.st.GetNode(id); gerr == nil && n.AgentVersion != "" {
+				ver = "（当前 " + n.AgentVersion + "）"
+			}
+			text = "节点上的 Agent 版本过旧" + ver + "，在目标机重跑一次安装命令即可升级"
+		}
+		writeErr(w, http.StatusConflict, text)
+		return
+	}
+	writeOK(w, map[string]any{
+		"ok":        true,
+		"message":   msg,
+		"container": item.ContainerName,
+	})
+}
+
+// handleNodeUpdateProject 点一次，把这个 compose 项目下的容器依次重建。
+//
+// 成员以 Hub 手上的快照为准：项目名是前端传的，但「这个项目里现在有哪几个
+// 容器、谁还需要更新」由服务端现查 —— 页面可能已经开了几分钟。
+func (s *Server) handleNodeUpdateProject(w http.ResponseWriter, id int64, project string) {
+	list, err := s.st.ListNodeContainers(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "读取节点快照失败: "+err.Error())
+		return
+	}
+	var members []model.NodeContainer
+	for _, c := range list {
+		if c.Origin != model.OriginContainer || c.ComposeProject != project || c.Ignored {
+			continue
+		}
+		if c.Status != model.StatusUpdatePending && c.Status != model.StatusNewTag {
+			continue
+		}
+		members = append(members, c)
+	}
+	if len(members) == 0 {
+		writeErr(w, http.StatusConflict, "这个项目下当前没有可更新的容器，刷新一下再看")
+		return
+	}
+
+	msg, err := s.hub.UpdateBatch(id, project, members)
+	if err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	names := make([]string, 0, len(members))
+	for _, m := range members {
+		names = append(names, m.ContainerName)
+	}
+	writeOK(w, map[string]any{
+		"ok":         true,
+		"message":    msg,
+		"project":    project,
+		"count":      len(members),
+		"containers": names,
+	})
+}
+
+// handleNodeUpgrade 让某个节点把自己升级到 Hub 这一版。
+//
+// 与「更新容器」最大的不同：这件事会把这个节点本身停掉重建，所以接口只保证
+// 「已经开始了」。结果由那台机器重新上线后的第一份上报带回来，
+// 页面上的版本号会自己变，按钮也会自己消失。
+func (s *Server) handleNodeUpgrade(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	msg, err := s.hub.Upgrade(id)
+	if err != nil {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeOK(w, map[string]any{"ok": true, "message": msg})
+}
+
 // handleNodeContainers 某个节点的容器快照。
 func (s *Server) handleNodeContainers(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
@@ -261,19 +445,7 @@ func (s *Server) publicHubURL(r *http.Request) string {
 // 只有目标机架构与 Hub 不同时才会走到这里 —— 跨架构没法下发二进制，
 // 只能让目标机去拉一个对应架构的镜像。
 func (s *Server) agentImage() string {
-	if v := strings.TrimSpace(s.cfg.AgentImage); v != "" {
-		return v
-	}
-	// 跟上 Hub 自己的版本，而不是笼统的 latest：latest 指向什么永远是未知数，
-	// 「装了却跑成旧版」正是这种不确定性造成的。
-	//
-	// 去掉前缀 v：CI 按 git tag 传进来的是 v1.7.5，而 Docker Hub 上的镜像标签
-	// 是 1.7.5。少这一下，跨架构回退时会去拉一个不存在的标签。
-	tag := strings.TrimPrefix(strings.TrimSpace(selfcheck.Version), "v")
-	if tag == "" || tag == "dev" {
-		tag = "latest"
-	}
-	return "haihaipypy/autodocker:" + tag
+	return selfcheck.AgentImage(s.cfg.AgentImage)
 }
 
 // nodeTokenFrom 取节点令牌。
@@ -504,6 +676,7 @@ if [ "$MODE" = "image" ]; then
     -e AUTODOCKER_HUB="$HUB_URL" \
     -e AUTODOCKER_TOKEN="$TOKEN" \
     -e AUTODOCKER_NODE_NAME="$NODE_NAME" \
+    -e SELF_CONTAINER="$CONTAINER" \
     "$IMAGE" >/dev/null
 else
   docker run -d --name "$CONTAINER" --restart=unless-stopped \
@@ -515,6 +688,7 @@ else
     -e AUTODOCKER_HUB="$HUB_URL" \
     -e AUTODOCKER_TOKEN="$TOKEN" \
     -e AUTODOCKER_NODE_NAME="$NODE_NAME" \
+    -e SELF_CONTAINER="$CONTAINER" \
     "$BASE_IMAGE" >/dev/null
 fi
 

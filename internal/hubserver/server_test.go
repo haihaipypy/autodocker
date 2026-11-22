@@ -261,3 +261,159 @@ func waitContainers(t *testing.T, st *store.Store, nodeID int64, want int) {
 	list, _ := st.ListNodeContainers(nodeID)
 	t.Fatalf("等待快照落库超时：期望 %d 条，实际 %d 条", want, len(list))
 }
+
+// replyAfter 读一条指令，按给定的结果回执。用来模拟 Agent 那一侧。
+func replyAfter(t *testing.T, c *websocket.Conn, ok bool, msg string) {
+	t.Helper()
+	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var f hubproto.Frame
+	if err := c.ReadJSON(&f); err != nil {
+		t.Errorf("Agent 侧没有收到指令: %v", err)
+		return
+	}
+	raw, _ := json.Marshal(hubproto.CmdAck{Message: msg})
+	_ = c.WriteJSON(hubproto.Frame{Type: hubproto.TypeCmdAck, ID: f.ID, OK: ok, Error: msg, Data: raw})
+}
+
+// SendWait 要真的等到回执，否则页面上「点更新」只能靠猜。
+func TestSendWaitReturnsAckMessage(t *testing.T) {
+	srv, _, ts, nodeID := newTestHub(t)
+
+	c, _, err := dialAgent(t, ts, "secret-token")
+	if err != nil {
+		t.Fatalf("连接失败: %v", err)
+	}
+	defer c.Close()
+	sendHello(t, c, hubproto.Protocol)
+
+	go replyAfter(t, c, true, "已开始更新")
+	msg, err := srv.SendWait(nodeID, hubproto.ActionUpdate,
+		hubproto.Cmd{ContainerID: "c1", ContainerName: "web"}, 3*time.Second)
+	if err != nil {
+		t.Fatalf("等回执失败: %v", err)
+	}
+	if msg != "已开始更新" {
+		t.Errorf("回执文案没带回来，实际 %q", msg)
+	}
+}
+
+// 旧 Agent 会 ack 一句「不支持的指令」。原文必须原样回到 API 层，
+// 由它翻译成「去目标机重跑安装命令」—— 这里只是不能把它当成成功。
+func TestSendWaitSurfacesAgentError(t *testing.T) {
+	srv, _, ts, nodeID := newTestHub(t)
+
+	c, _, err := dialAgent(t, ts, "secret-token")
+	if err != nil {
+		t.Fatalf("连接失败: %v", err)
+	}
+	defer c.Close()
+	sendHello(t, c, hubproto.Protocol)
+
+	go replyAfter(t, c, false, "不支持的指令: update")
+	_, err = srv.SendWait(nodeID, hubproto.ActionUpdate, hubproto.Cmd{ContainerID: "c1"}, 3*time.Second)
+	if err == nil {
+		t.Fatal("Agent 回了失败，SendWait 不该返回成功")
+	}
+	if !strings.Contains(err.Error(), "不支持的指令") {
+		t.Errorf("错误文案应原样透传，实际 %q", err.Error())
+	}
+}
+
+// 节点不回执时必须超时返回，不能把 API 请求永远挂住。
+func TestSendWaitTimesOut(t *testing.T) {
+	srv, _, ts, nodeID := newTestHub(t)
+
+	c, _, err := dialAgent(t, ts, "secret-token")
+	if err != nil {
+		t.Fatalf("连接失败: %v", err)
+	}
+	defer c.Close()
+	sendHello(t, c, hubproto.Protocol)
+
+	start := time.Now()
+	if _, err := srv.SendWait(nodeID, hubproto.ActionUpdate, hubproto.Cmd{ContainerID: "c1"}, 300*time.Millisecond); err == nil {
+		t.Fatal("没人回执，应当超时报错")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Errorf("超时时间没生效，等了 %v", time.Since(start))
+	}
+
+	// 节点不在线时要立刻报错，不等超时
+	if _, err := srv.SendWait(9999, hubproto.ActionUpdate, nil, time.Second); err == nil {
+		t.Error("给不在线的节点下发更新应报错")
+	}
+}
+
+// 进度事件要能在 Hub 侧拼出「现在在干什么」，完成态还要留一会儿给页面读到。
+func TestOpStateFollowsEvents(t *testing.T) {
+	srv, _, ts, nodeID := newTestHub(t)
+
+	c, _, err := dialAgent(t, ts, "secret-token")
+	if err != nil {
+		t.Fatalf("连接失败: %v", err)
+	}
+	defer c.Close()
+	sendHello(t, c, hubproto.Protocol)
+
+	send := func(phase, msg string, taskID int64) {
+		raw, _ := json.Marshal(hubproto.Event{
+			OpID: "u-1", Kind: "update", Phase: phase,
+			ContainerID: "c1", ContainerName: "web", Message: msg,
+			TaskID: taskID, At: time.Now().Unix(),
+		})
+		if err := c.WriteJSON(hubproto.Frame{Type: hubproto.TypeEvent, Data: raw}); err != nil {
+			t.Fatalf("发送事件失败: %v", err)
+		}
+	}
+
+	send(hubproto.PhaseStart, "开始更新 web", 7)
+
+	// 事件是异步处理的，等它落进内存
+	var op *OpState
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if op = srv.Op(nodeID); op != nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if op == nil {
+		t.Fatal("进度事件没有记下来")
+	}
+	if op.Phase != hubproto.PhaseStart || op.ContainerName != "web" || op.TaskID != 7 {
+		t.Errorf("操作状态不对: %+v", op)
+	}
+
+	send(hubproto.PhaseProgress, "拉取镜像 nginx:1.27", 7)
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if op = srv.Op(nodeID); op != nil && op.Phase == hubproto.PhaseProgress {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if op == nil || op.Message != "拉取镜像 nginx:1.27" {
+		t.Fatalf("进度文案没更新: %+v", op)
+	}
+
+	// 完成态要留着，否则用户点完按钮只会看到横幅闪一下就没了
+	send(hubproto.PhaseDone, "更新完成", 7)
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if op = srv.Op(nodeID); op != nil && op.Phase == hubproto.PhaseDone {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if op == nil || op.Phase != hubproto.PhaseDone {
+		t.Fatalf("完成态没保留: %+v", op)
+	}
+
+	// 过了保留期必须自己消失，否则页面会永远挂着一条「更新中」
+	srv.opsMu.Lock()
+	srv.ops[nodeID].UpdatedAt = time.Now().Add(-2 * opDoneTTL)
+	srv.opsMu.Unlock()
+	if got := srv.Op(nodeID); got != nil {
+		t.Errorf("过期后不该再返回操作状态: %+v", got)
+	}
+}
