@@ -47,7 +47,7 @@ func TestParseMirrors(t *testing.T) {
 // 万一哪天有人图省事把常量改成别的写法，这条能立刻发现问题。
 func TestDefaultMirrorParses(t *testing.T) {
 	got := ParseMirrors(DefaultMirror)
-	want := []string{"docker.1ms.run", "docker.xuanyuan.me"}
+	want := []string{"docker.1ms.run", "docker.1panel.live"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ParseMirrors(DefaultMirror) = %v, 期望 %v", got, want)
 	}

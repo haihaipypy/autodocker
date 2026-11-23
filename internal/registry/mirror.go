@@ -8,11 +8,14 @@ import (
 //
 // 国内直连 Docker Hub 基本不通，用户没填、Docker 守护进程也没配加速器时，
 // 若还坚持「什么都不用」，镜像列表会整列显示「未知」，新装用户只会一脸茫然。
-// 这里给一个开箱即用的默认值 —— 1ms.run 实测最快（几百毫秒），轩源作备用。
+// 这里给一个开箱即用的默认值 —— 1ms.run 实测最快（几百毫秒），1panel 作备用。
+//
+// 备用源要挑「还愿意给匿名流量」的：轩源（xuanyuan.me）后来对任何仓库都回
+// 403「免费节点当前繁忙」，排在第二位只会让每轮检测白等一次超时，已换掉。
 //
 // 写成带协议与结尾斜杠的完整形式只是为了和用户在设置页里看到的样子一致，
 // 真正使用时会被 ParseMirrors 归一化成裸主机名。
-const DefaultMirror = "https://docker.1ms.run/,https://docker.xuanyuan.me/"
+const DefaultMirror = "https://docker.1ms.run/,https://docker.1panel.live/"
 
 // ParseMirrors 解析镜像加速主机列表。
 //

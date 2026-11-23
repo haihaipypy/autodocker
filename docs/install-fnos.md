@@ -36,7 +36,7 @@ appcenter-cli install-fpk Autodocker.fpk
 | 向导项 | 说明 |
 | --- | --- |
 | 自动巡检间隔 | 默认 1 小时，也可选「关闭定时巡检」只手动扫描 |
-| 镜像加速地址 | 可留空。留空时程序先沿用 Docker 守护进程已配的加速器，仍为空则使用内置默认 `docker.1ms.run,docker.xuanyuan.me`；要自己指定就填这里，多个地址用逗号分隔、按顺序回退 |
+| 镜像加速地址 | 可留空。留空时程序先沿用 Docker 守护进程已配的加速器，仍为空则使用内置默认 `docker.1ms.run,docker.1panel.live`；要自己指定就填这里，多个地址用逗号分隔、按顺序回退 |
 
 > **为什么要单独配一次加速。** 本服务查镜像摘要是自己发 HTTP 请求，
 > 不会继承 Docker 守护进程 `daemon.json` 里的 `registry-mirrors`；

@@ -62,6 +62,22 @@ type Config struct {
 	// 用回调而不是布尔值：这个开关在设置页随时可改，传值的话改完得重启才生效。
 	// 为 nil 表示不自动升级，只能由用户点按钮。
 	AutoUpgrade func() bool
+
+	// Mirrors 返回要下发给节点的镜像加速地址（三态：nil 不动 / 空切片清空 / 有值替换）。
+	//
+	// 同样用回调：地址与开关都在设置页里，改完应当对下一次握手与下一次广播
+	// 立刻生效，而不是等进程重启。为 nil 表示这个能力不存在（测试场景）。
+	Mirrors func() *[]string
+
+	// OfflineAlert 返回「要不要报警」与「失联多久算数」。
+	// 为 nil 表示不报警。
+	OfflineAlert func() (bool, time.Duration)
+
+	// PushText 推一条纯文本消息，不带按钮、不进通知表。
+	//
+	// 节点失联没有「哪个容器要更新」这回事，硬塞进 Notification 只会让
+	// 历史列表里多出一条点不动的记录。为 nil 时只写日志。
+	PushText func(ctx context.Context, title, body string)
 }
 
 // Notifier 推送一条提醒，返回平台侧消息 ID。
@@ -101,6 +117,16 @@ type Server struct {
 	// 它比 Op 多的是「一共几个、跑到第几个」，页面靠它显示进度条式的文案。
 	batchMu sync.Mutex
 	batches map[int64]*BatchState
+
+	// 失联告警用。
+	//
+	// startedAt 是「本进程开始管事」的时刻：宽限期内不发任何失联消息。
+	// 进程刚起来时所有节点都在重连，那几十秒里看到的「离线」不是故障。
+	startedAt time.Time
+	// seen 记本次运行里真正连上过的节点。只有它们才可能触发失联告警 ——
+	// 重启后从没露面的节点，说明不了「刚掉线」，只能说明「一直没连上」。
+	seenMu sync.Mutex
+	seen   map[int64]bool
 }
 
 // OpState 一个节点上正在进行的操作，直接序列化给页面。
@@ -159,6 +185,8 @@ func New(cfg Config, st *store.Store, logger *slog.Logger) *Server {
 		lastUpgrade: map[int64]hubproto.UpgradeResult{},
 		autoTries:   map[int64]autoTry{},
 		batches:     map[int64]*BatchState{},
+		startedAt:   time.Now(),
+		seen:        map[int64]bool{},
 		upgrader: websocket.Upgrader{
 			HandshakeTimeout: 15 * time.Second,
 			ReadBufferSize:   4096,
@@ -555,15 +583,26 @@ func (s *Server) HandleWS(w http.ResponseWriter, r *http.Request) {
 	s.register(c)
 	defer s.unregister(c)
 
+	// 把 Hub 侧的加速地址随回执一起带下去：Agent 拿到就能立刻用上，
+	// 不用等下一次配置广播。三态语义见 HelloOK.Mirrors 的注释。
+	var mirrors *[]string
+	if s.cfg.Mirrors != nil {
+		mirrors = s.cfg.Mirrors()
+	}
 	if err := c.write(hubproto.Frame{Type: hubproto.TypeHelloOK}, hubproto.HelloOK{
 		NodeID:       node.ID,
 		NodeName:     name,
 		HubVersion:   s.cfg.Version,
 		ScanInterval: s.cfg.ScanInterval,
+		Mirrors:      mirrors,
 	}); err != nil {
 		s.log.Warn("回执发送失败", "node", name, "err", err)
 		return
 	}
+	s.markSeen(node.ID)
+	// 之前报过「失联」的节点回来了，补一条恢复消息 —— 否则那条告警
+	// 会永远停在「它挂了」，用户不会再去看一眼。
+	s.reportRecovered(node.ID, name)
 	s.log.Info("节点已上线", "node", name, "node_id", node.ID,
 		"hostname", h.Hostname, "os", h.OS, "agent", h.AgentVersion)
 
@@ -607,7 +646,14 @@ func (s *Server) readLoop(c *conn, name string) {
 			s.handleEvent(c.nodeID, name, f)
 		case hubproto.TypeCmdAck:
 			if !f.OK {
-				s.log.Warn("节点指令执行失败", "node", name, "id", f.ID, "err", f.Error)
+				// 配置下发失败落在 Debug：还没升级的 Agent 不认识这条指令，
+				// 回一句「不支持的指令: config」是它的正常表现，不是故障。
+				// 升级上来之后自然就认了，为它刷 Warn 只会让人去查不该查的地方。
+				if f.Action == hubproto.ActionConfig {
+					s.log.Debug("节点未接受配置下发", "node", name, "err", f.Error)
+				} else {
+					s.log.Warn("节点指令执行失败", "node", name, "id", f.ID, "err", f.Error)
+				}
 			}
 			c.deliverAck(f)
 		}

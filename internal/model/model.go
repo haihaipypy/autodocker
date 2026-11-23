@@ -462,6 +462,22 @@ type Settings struct {
 	RegistryMirror    string `json:"registry_mirror"`
 	RegistryInsecure  bool   `json:"registry_insecure"`
 
+	// NodeMirrorFollow 把上面这份加速地址下发给所有节点（默认开）。
+	//
+	// 节点的检测是 Agent 自己发 HTTP 请求，不经过 Docker 守护进程，
+	// 所以宿主机配的 registry-mirrors 它一个都看不到 —— 这是那种
+	// 「能拉镜像、节点页却整列未知」的一半原因。开着就由 Hub 统一决定。
+	// 用指针是为了区分「老库没有这个字段」与「用户显式关掉」。
+	NodeMirrorFollow *bool `json:"node_mirror_follow"`
+
+	// NodeOfflineAlert 节点失联时推一条消息（默认开）。
+	NodeOfflineAlert *bool `json:"node_offline_alert"`
+	// NodeOfflineAfter 失联多久才算数（**分钟**），默认 10。
+	//
+	// 不能比「Agent 自动升级耗时」还短：升级会主动停容器再重建，
+	// 那几十秒的断线是计划内的，报了就是误报。
+	NodeOfflineAfter int `json:"node_offline_after"`
+
 	// 设置页当前打开的那一栏（feishu / telegram / dingtalk），只影响显示哪份表单，
 	// **不决定消息发给谁** —— 填好且开着开关的渠道都会收到。
 	NotifyChannel string `json:"notify_channel"`

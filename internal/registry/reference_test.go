@@ -115,3 +115,36 @@ func TestStringNormalization(t *testing.T) {
 		t.Fatalf("FullRepository = %q，library/ 前缀不能省", ref.FullRepository())
 	}
 }
+
+// 镜像 ID 必须和真正的引用区分开：容器的 Config.Image 可能存的是一串 ID，
+// 按引用去解析它语法上过得去、语义是假的，查注册表永远查不到。
+func TestIsImageID(t *testing.T) {
+	ids := []string{
+		"c4d252255b7b", // docker ps 里那种短 ID
+		"04225415df99",
+		"sha256:eeaf36f3057657ebb9447e3465db1a4e785156a9817155c5b020b85edd028d15",
+		"EEAF36F3057657EBB9447E3465DB1A4E", // 大小写都认
+	}
+	for _, s := range ids {
+		if !IsImageID(s) {
+			t.Errorf("IsImageID(%q) = false，应该认成镜像 ID", s)
+		}
+	}
+
+	refs := []string{
+		"",
+		"nginx",
+		"nginx:latest",
+		"chaitin/safeline-detector:9.4.7",
+		"docker.io/library/nginx",
+		"ghcr.io/haihaipypy/autodocker:1.12.1",
+		"myregistry:5000/app", // 这个冒号是端口，不是 tag，更不能当 ID
+		"deadbeefcafz",        // 够长，但带一个非十六进制字母，是仓库名不是 ID
+		"abc123",              // 太短
+	}
+	for _, s := range refs {
+		if IsImageID(s) {
+			t.Errorf("IsImageID(%q) = true，这不是镜像 ID", s)
+		}
+	}
+}

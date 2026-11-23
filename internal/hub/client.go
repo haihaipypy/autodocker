@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +47,22 @@ type Config struct {
 	// 重连退避
 	ReconnectMin time.Duration
 	ReconnectMax time.Duration
+
+	// BaseMirrors 是这台机器自己配的加速源（环境变量 / 安装时填的）。
+	//
+	// Hub 下发空列表表示「别用它那套了」，此时回退到这里 —— 不是回退到空，
+	// 那样会把本来能用的配置一起抹掉。
+	BaseMirrors []string
+
+	// InitialMirrors 是启动那一刻实际该用的源。
+	//
+	// 与 BaseMirrors 分开是因为两者会不一样：上次 Hub 下发过一份，
+	// 节点重启后应当先按它走（Hub 可能一时连不上），但「Hub 说清空」时
+	// 仍要退回 BaseMirrors —— 那才是这台机器自己的配置。
+	InitialMirrors []string
+
+	// OnMirrors 应用一份新的加速源。为 nil 表示这台 Agent 不管加速源。
+	OnMirrors func(mirrors []string)
 }
 
 // Client Agent 侧客户端。
@@ -72,6 +89,29 @@ type Client struct {
 	// 那一次上报本身就是「我还活着、现在是哪个版本」的证明，顺手把
 	// 升级有没有成功一起告诉 Hub，用户不用去翻目标机的 docker logs。
 	upgradeRes *hubproto.UpgradeResult
+
+	// 当前生效的加速源。只用来判断「这份配置跟上一份一样吗」——
+	// 一样就什么都不做，免得每次重连都白刷一遍日志与设置表。
+	mirrorMu sync.Mutex
+	mirrors  []string
+}
+
+// MirrorsSettingKey 是「Hub 下发的加速源」在设置表里的键名。
+//
+// 节点重启后先用它，连上 Hub 之后再被覆盖：Hub 暂时连不上时，
+// 检测仍然按用户配好的源走，而不是莫名其妙退回内置默认。
+const MirrorsSettingKey = "agent_mirrors"
+
+func (c *Client) mirrorList() []string {
+	c.mirrorMu.Lock()
+	defer c.mirrorMu.Unlock()
+	return append([]string(nil), c.mirrors...)
+}
+
+func (c *Client) setMirrorList(list []string) {
+	c.mirrorMu.Lock()
+	c.mirrors = append([]string(nil), list...)
+	c.mirrorMu.Unlock()
 }
 
 // New 构造客户端。ring 提供最近日志，随每次上报一起送出去；
@@ -90,7 +130,15 @@ func New(cfg Config, sc *scanner.Scanner, st *store.Store, dk *dockerx.Client,
 	if ring == nil {
 		ring = NewRing(200)
 	}
-	return &Client{cfg: cfg, sc: sc, st: st, dk: dk, up: up, log: logger, ring: ring}
+	// 起始状态：优先用上次实际生效的那份，没有就是本机自己的。
+	initial := cfg.InitialMirrors
+	if len(initial) == 0 {
+		initial = cfg.BaseMirrors
+	}
+	return &Client{
+		cfg: cfg, sc: sc, st: st, dk: dk, up: up, log: logger, ring: ring,
+		mirrors: append([]string(nil), initial...),
+	}
 }
 
 // Ring 返回日志环形缓冲，交给 slog 的 MultiWriter 用，
@@ -193,6 +241,9 @@ func (c *Client) session(ctx context.Context) (bool, error) {
 		if ok.ScanInterval > 0 {
 			c.cfg.ScanInterval = time.Duration(ok.ScanInterval) * time.Second
 		}
+		// 加速源随回执一起来：连上的那一刻就该用上，而不是等第一次巡检
+		// 撞一墙 401 之后再想起要换。
+		c.applyMirrors(ok.Mirrors)
 	case hubproto.TypeFatal:
 		return false, errors.New("Hub 拒绝连接: " + f.Error)
 	default:
@@ -260,52 +311,52 @@ func (c *Client) handleCmd(ctx context.Context, f hubproto.Frame) {
 		// 同时因为 containers 是旧数据、ScanError 非空，它会保留既有快照，
 		// 页面上不会因为一次 Docker 抖动就整台机器清空。
 		if err := c.report(ctx); err != nil {
-			c.ack(f.ID, false, "上报失败: "+err.Error())
+			c.ack(f, false, "上报失败: "+err.Error())
 			return
 		}
 		if scanErr != nil && !errors.Is(scanErr, scanner.ErrScanRunning) {
-			c.ack(f.ID, false, scanErr.Error())
+			c.ack(f, false, scanErr.Error())
 			return
 		}
-		c.ack(f.ID, true, "巡检完成")
+		c.ack(f, true, "巡检完成")
 
 	case hubproto.ActionUpdate:
 		var cmd hubproto.Cmd
 		_ = json.Unmarshal(f.Data, &cmd)
 		if cmd.ContainerID == "" {
-			c.ack(f.ID, false, "缺少容器标识")
+			c.ack(f, false, "缺少容器标识")
 			return
 		}
 		if c.up == nil {
-			c.ack(f.ID, false, "这台 Agent 未启用更新能力")
+			c.ack(f, false, "这台 Agent 未启用更新能力")
 			return
 		}
 		if c.up.Busy() {
-			c.ack(f.ID, false, hubproto.ErrBusy)
+			c.ack(f, false, hubproto.ErrBusy)
 			return
 		}
 		// 先回执再动手：重建要几十秒到几分钟，回执必须立刻发出去，
 		// 否则 Hub 只能等到结束才知道这条指令到底有没有被接受。
 		// 后续进度一律走 event 帧，回执只表示「收到并开工」。
-		c.ack(f.ID, true, "已开始更新")
+		c.ack(f, true, "已开始更新")
 		c.runUpdate(ctx, cmd)
 
 	case hubproto.ActionPull:
 		var cmd hubproto.Cmd
 		_ = json.Unmarshal(f.Data, &cmd)
 		if cmd.ContainerID == "" {
-			c.ack(f.ID, false, "缺少容器标识")
+			c.ack(f, false, "缺少容器标识")
 			return
 		}
 		if c.up == nil {
-			c.ack(f.ID, false, "这台 Agent 未启用更新能力")
+			c.ack(f, false, "这台 Agent 未启用更新能力")
 			return
 		}
 		if c.up.Busy() {
-			c.ack(f.ID, false, hubproto.ErrBusy)
+			c.ack(f, false, hubproto.ErrBusy)
 			return
 		}
-		c.ack(f.ID, true, "开始拉取镜像")
+		c.ack(f, true, "开始拉取镜像")
 		c.runPull(ctx, cmd)
 
 	case hubproto.ActionUpgrade:
@@ -328,15 +379,65 @@ func (c *Client) handleCmd(ctx context.Context, f hubproto.Frame) {
 			ImageRef:      cmd.ImageRef,
 		}, c.log)
 		if err != nil {
-			c.ack(f.ID, false, "无法自动升级: "+err.Error())
+			c.ack(f, false, "无法自动升级: "+err.Error())
 			return
 		}
-		c.ack(f.ID, true, msg)
+		c.ack(f, true, msg)
 		// 从这里开始不再做任何事：几秒后 helper 会把本容器停掉。
 		// 不回 event、不去刷新状态 —— 那些都要靠一条马上就不存在的连接。
 
+	case hubproto.ActionConfig:
+		var cmd hubproto.Cmd
+		if err := json.Unmarshal(f.Data, &cmd); err != nil {
+			c.ack(f, false, "配置内容无法解析: "+err.Error())
+			return
+		}
+		if cmd.Mirrors == nil {
+			c.ack(f, false, "配置里没有镜像加速地址")
+			return
+		}
+		c.applyMirrors(cmd.Mirrors)
+		if len(*cmd.Mirrors) == 0 {
+			c.ack(f, true, "已改回本机自己的加速源")
+			return
+		}
+		c.ack(f, true, fmt.Sprintf("已应用 %d 个加速地址", len(*cmd.Mirrors)))
+
 	default:
-		c.ack(f.ID, false, "不支持的指令: "+f.Action)
+		c.ack(f, false, "不支持的指令: "+f.Action)
+	}
+}
+
+// applyMirrors 应用一份新的加速源并落盘。
+//
+// 落盘是为了「Hub 连不上的时候检测也别退化」：节点重启后、握手完成之前
+// 用的是本地记住的那份，而不是内置默认。Hub 下发空列表时回退到本机配置，
+// 把「用户清空了 Hub 那一格」和「把节点上的源也清干净」区分开。
+func (c *Client) applyMirrors(m *[]string) {
+	if m == nil {
+		return
+	}
+	list := *m
+	if len(list) == 0 {
+		list = c.cfg.BaseMirrors
+	}
+	if slices.Equal(list, c.mirrorList()) {
+		return
+	}
+	if c.cfg.OnMirrors != nil {
+		c.cfg.OnMirrors(list)
+	}
+	c.setMirrorList(list)
+	c.log.Info("已应用镜像加速地址", "mirrors", strings.Join(list, ","))
+
+	// 存的是「实际在用的那份」，不是 Hub 原样下发的值 ——
+	// 重启后要还原的是同一份行为，不是同一串字符。
+	raw, err := json.Marshal(list)
+	if err != nil {
+		return
+	}
+	if err := c.st.SetSetting(MirrorsSettingKey, string(raw)); err != nil {
+		c.log.Warn("记住加速地址失败", "err", err)
 	}
 }
 
@@ -530,15 +631,20 @@ func (c *Client) updateTarget(containerID, containerName string) (imageRef, targ
 	return imageRef, ref.WithTag(img.LatestTag)
 }
 
-func (c *Client) ack(id string, ok bool, msg string) {
-	if id == "" {
+// ack 回一条指令结果。
+//
+// 连 action 一起带回去：Hub 那边要靠它区分「这条失败要不要紧」。
+// 比如老 Agent 收到不认识的 config 指令，回一句「不支持的指令」是正常现象，
+// 不该和「更新失败」一样刷 Warn —— 没有 action，Hub 只能一刀切。
+func (c *Client) ack(f hubproto.Frame, ok bool, msg string) {
+	if f.ID == "" {
 		return
 	}
-	f := hubproto.Frame{Type: hubproto.TypeCmdAck, ID: id, OK: ok, Error: msg}
+	af := hubproto.Frame{Type: hubproto.TypeCmdAck, ID: f.ID, Action: f.Action, OK: ok, Error: msg}
 	if ok {
-		f.Error = ""
+		af.Error = ""
 	}
-	_ = c.sendFrame(f, hubproto.CmdAck{Message: msg})
+	_ = c.sendFrame(af, hubproto.CmdAck{Message: msg})
 }
 
 // scanLoop 周期巡检。连上后先立刻扫一次，让 Hub 马上有数据可看。

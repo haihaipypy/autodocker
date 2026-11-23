@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -299,8 +300,128 @@ func (s *Scanner) skip(c dockerx.Container, opt Options) bool {
 	return false
 }
 
+// resolveImageRef 把「用镜像 ID 起的容器」还原成它真正的仓库引用。
+//
+// Config.Image 里存的本来应该是仓库引用，但用 docker run <镜像ID> 起的容器、
+// 或在面板里按 ID 重建过的容器，存的就是一串 ID。把这串 ID 当引用去查注册表，
+// 得到的是「library/c4d252255b7b:latest 不存在」—— 用户看到「所有镜像源均失败」，
+// 跑去换加速源、查网络，而真正的问题跟镜像源毫无关系。
+//
+// 镜像身上通常还挂着当初拉取时的仓库名，就地取回来即可。取不回来时保持原样，
+// 由调用方如实说明「查不了」，不硬编一个假引用。
+func (s *Scanner) resolveImageRef(ctx context.Context, c dockerx.Container) dockerx.Container {
+	if !registry.IsImageID(c.Image) {
+		return c
+	}
+	id := c.ImageID
+	if id == "" {
+		id = c.Image
+	}
+	tags, _, err := s.dk.ImageNames(ctx, id)
+	if err != nil {
+		s.log.Debug("读取镜像仓库名失败", "container", c.Name, "image", c.Image, "err", err)
+		return c
+	}
+	ref, ok := pickImageRef(tags)
+	if !ok {
+		return c
+	}
+	// 老记录是按那串 ID 存的，直接换引用会多出一条：唯一键是「引用 + 容器号」，
+	// 引用变了就是新键。就地改掉老记录，用户的「忽略」「检测模式」这些设定才不会丢。
+	if old, err := s.st.FindImage(c.Image, c.ID); err == nil {
+		if uerr := s.st.UpdateImageAfterRebuild(old.ID, ref, c.ImageID, c.ID, c.Name, old.LocalDigest, ""); uerr != nil {
+			s.log.Warn("迁移镜像记录到仓库引用失败", "image", c.Image, "ref", ref, "err", uerr)
+		}
+	}
+	s.log.Info("按镜像 ID 找回仓库引用", "container", c.Name, "image", c.Image, "ref", ref)
+	c.Image = ref
+	return c
+}
+
+// pickImageRef 从镜像登记的仓库名里挑一个用来查更新的引用。
+//
+// 同一个镜像可能同时挂着好几个名字（:latest 与 :9.4.7 并存，或迁移时留下过
+// 内部仓库地址）。挑法固定：Docker Hub 的排在其它注册表前面，带版本号的排在
+// latest 前面，剩下的按名字排 —— 每轮挑中的必须是同一个，否则今天盯 :9.4.7、
+// 明天盯 :latest，本地版本这一栏会来回跳。
+//
+// 版本号优先是因为它还能带来「上游出了更新版本」的提醒；latest 只能比对
+// 内容有没有被偷偷改掉，看不出新版本。
+func pickImageRef(tags []string) (string, bool) {
+	type cand struct {
+		ref  string
+		rank int
+	}
+	cands := make([]cand, 0, len(tags))
+	for _, t := range tags {
+		if strings.Contains(t, "<none>") {
+			continue
+		}
+		r, err := registry.ParseReference(t)
+		if err != nil {
+			continue
+		}
+		rank := 0
+		if r.Registry != registry.DefaultRegistryAPI {
+			rank += 2 // 先不信任别的注册表：多半是迁移时留下的旧地址
+		}
+		if r.Tag == "latest" {
+			rank++
+		}
+		cands = append(cands, cand{ref: t, rank: rank})
+	}
+	if len(cands) == 0 {
+		return "", false
+	}
+	slices.SortFunc(cands, func(a, b cand) int {
+		if a.rank != b.rank {
+			return a.rank - b.rank
+		}
+		return strings.Compare(a.ref, b.ref)
+	})
+	return cands[0].ref, true
+}
+
+// markUncheckable 记下「这个容器查不了更新」，并写明为什么。
+//
+// 状态仍是 unknown（确实没查到结果），但原因要说清是「没有引用可查」而不是
+// 「镜像源不给你查」—— 后者会让用户去换加速源，换多少次都没用。
+func (s *Scanner) markUncheckable(existing *model.Image, c dockerx.Container) Result {
+	status := model.StatusUnknown
+	if existing != nil && existing.Ignored {
+		status = model.StatusIgnored
+	}
+	img := s.upsertImage(existing, c, registry.Reference{}, status, "")
+	if status == model.StatusIgnored {
+		return Result{Skipped: true}
+	}
+	_ = s.st.UpdateImageCheck(img.ID, status, "", "", nil, img.Mode, uncheckableReason(c))
+	return Result{Skipped: true}
+}
+
+// uncheckableReason 说明为什么这个容器查不了更新，并给出能照着做的一步。
+//
+// 「把它改成带 tag 的完整引用」这种话在这里没用 —— 页面上没有改引用的入口，
+// 容器的 Config.Image 也是创建时就定死的，用户看完只能干瞪眼。compose 起的
+// 容器带着项目、服务名和工作目录，直接给重建命令，那才是他能执行的动作。
+func uncheckableReason(c dockerx.Container) string {
+	service := c.Labels["com.docker.compose.service"]
+	if service != "" {
+		where := "compose 目录"
+		if dir := c.Labels["com.docker.compose.project.working_dir"]; dir != "" {
+			where = dir
+		}
+		return fmt.Sprintf("镜像已无标签（只剩 ID），本机查不到仓库名。"+
+			"到 %s 执行 docker compose up -d --force-recreate %s 重建一次即可恢复检测。", where, service)
+	}
+	return fmt.Sprintf("镜像只有 ID（%s），本机找不到它对应的仓库名。"+
+		"用原来的镜像名重跑一次这个容器即可恢复检测。", c.Image)
+}
+
 // checkContainer 检测单个本地容器。
 func (s *Scanner) checkContainer(ctx context.Context, c dockerx.Container, force bool) (Result, *updateHit) {
+	c = s.resolveImageRef(ctx, c)
+
 	ref, err := registry.ParseReference(c.Image)
 	if err != nil {
 		s.log.Warn("无法解析镜像引用", "image", c.Image, "err", err)
@@ -308,6 +429,13 @@ func (s *Scanner) checkContainer(ctx context.Context, c dockerx.Container, force
 	}
 
 	existing, findErr := s.st.FindImage(c.Image, c.ID)
+
+	// 找不回仓库名的镜像 ID：不去问注册表。
+	// 「library/c4d252255b7b:latest」这种引用语法合法、语义是假的，问出去只会
+	// 换来一串「镜像或 tag 不存在」，把用户永久钉在「检测异常」上。
+	if registry.IsImageID(c.Image) {
+		return s.markUncheckable(existing, c), nil
+	}
 
 	// 本地摘要必须和 upsert 一起落库。
 	//

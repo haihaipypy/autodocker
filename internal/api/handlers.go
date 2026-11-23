@@ -869,12 +869,31 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		in.PushToken = s.LoadSettings().PushToken
 	}
 
+	before := s.LoadSettings()
 	if err := s.saveSettings(in); err != nil {
 		writeErr(w, http.StatusInternalServerError, "保存设置失败: "+err.Error())
 		return
 	}
 	s.ApplySettings(in)
+	// 加速地址真的变了才推给在线节点：不然用户每次保存别的设置，
+	// 日志里都多一行「已下发加速地址」，看不出哪次是真的改了。
+	// 推失败也不报错 —— 节点会在下次握手时从回执里拿到同一份配置。
+	if s.hub != nil && mirrorPlanChanged(before, s.LoadSettings()) {
+		s.hub.BroadcastConfig()
+	}
 	writeOK(w, s.LoadSettings())
+}
+
+// mirrorPlanChanged 判断这次保存有没有动到「节点该用哪个加速源」。
+//
+// 只看两项：跳过下发的开关、以及加速地址本身。别的字段改了不该触发下发，
+// 那会让日志与节点侧的应用记录都变得没法读。
+func mirrorPlanChanged(before, after model.Settings) bool {
+	followOf := func(st model.Settings) bool {
+		return st.NodeMirrorFollow == nil || *st.NodeMirrorFollow
+	}
+	return followOf(before) != followOf(after) ||
+		strings.TrimSpace(before.RegistryMirror) != strings.TrimSpace(after.RegistryMirror)
 }
 
 // ---- 外部推送接口 ----
@@ -1354,6 +1373,24 @@ func (s *Server) LoadSettings() model.Settings {
 		out.AgentAutoUpgrade = &on
 	}
 
+	// 1.12.0 的两个新开关也默认开，理由同上：老库没有这两个字段，
+	// 当成关闭就等于用户升级后功能莫名不存在。
+	if out.NodeMirrorFollow == nil {
+		on := true
+		out.NodeMirrorFollow = &on
+	}
+	if out.NodeOfflineAlert == nil {
+		on := true
+		out.NodeOfflineAlert = &on
+	}
+	if out.NodeOfflineAfter <= 0 {
+		out.NodeOfflineAfter = defaultOfflineAfterMin
+	}
+	// 阈值给一个下限：填 5 秒等于每轮心跳抖一下都报，那不是告警是噪声。
+	if out.NodeOfflineAfter < minOfflineAfterMin {
+		out.NodeOfflineAfter = minOfflineAfterMin
+	}
+
 	return out
 }
 
@@ -1364,6 +1401,45 @@ func (s *Server) LoadSettings() model.Settings {
 func (s *Server) AgentAutoUpgrade() bool {
 	v := s.LoadSettings().AgentAutoUpgrade
 	return v == nil || *v
+}
+
+// 失联告警的时间参数，单位分钟。
+//
+// 默认 10 分钟：Agent 自动升级要停容器重建，全程约 1 分钟；家里网络抖动
+// 通常几十秒。短于这个值就会把计划内的重启当成故障报出来，
+// 长于它则真正关机了要等很久才知道。
+const (
+	defaultOfflineAfterMin = 10
+	minOfflineAfterMin     = 2
+)
+
+// NodeMirrors 返回该下发给节点的加速地址，三态见 hubproto.HelloOK.Mirrors。
+//
+// 开关关着 → nil（一个字节都不发，节点完全按自己的配置走）。
+// 开关开着 → 一律发一份：填了就发填的，留空就发空列表让节点回到自己的配置。
+// 这里刻意不把 Hub 的「守护进程兜底 / 内置默认」传下去 —— 那是这台机器的
+// 结论，换个机房就不成立了。
+func (s *Server) NodeMirrors() *[]string {
+	set := s.LoadSettings()
+	if set.NodeMirrorFollow != nil && !*set.NodeMirrorFollow {
+		return nil
+	}
+	list := registry.ParseMirrors(set.RegistryMirror)
+	if list == nil {
+		list = []string{}
+	}
+	return &list
+}
+
+// NodeOfflineAlert 返回「要不要报警」与「失联多久算数」。
+func (s *Server) NodeOfflineAlert() (bool, time.Duration) {
+	set := s.LoadSettings()
+	on := set.NodeOfflineAlert == nil || *set.NodeOfflineAlert
+	mins := set.NodeOfflineAfter
+	if mins < minOfflineAfterMin {
+		mins = minOfflineAfterMin
+	}
+	return on, time.Duration(mins) * time.Minute
 }
 
 // enabledOrDefault 开关没设置过时按「这个渠道配齐了没有」推导。

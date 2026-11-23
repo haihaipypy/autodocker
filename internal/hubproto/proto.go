@@ -55,6 +55,15 @@ const (
 	//
 	// 旧 Agent 会回"不支持的指令: pull"，Hub 认这句话，退化成逐个更新。
 	ActionPull = "pull"
+	// ActionConfig 下发 Hub 侧的运行配置（1.12.0 起）。
+	//
+	// 目前只有一项：镜像加速地址。节点的检测由 Agent 自己发 HTTP 请求，
+	// 不经过 Docker 守护进程，所以 Hub 里填好的加速源它一个都用不上 ——
+	// 宿主机能拉镜像、节点页却整列「未知」，根子就在这里。
+	//
+	// 老 Agent 会回"不支持的指令: config"，Hub 据此只记一行日志：
+	// 这是纯增量能力，不该因为某一个节点落后就把整条链路当成故障。
+	ActionConfig = "config"
 )
 
 // 事件阶段。一次操作的完整生命周期：start → progress* → done | failed。
@@ -137,6 +146,15 @@ type HelloOK struct {
 	NodeName     string `json:"node_name"`
 	HubVersion   string `json:"hub_version"`
 	ScanInterval int    `json:"scan_interval"` // 秒，0 表示沿用 Agent 自己配置
+
+	// Mirrors 要下发到节点的镜像加速地址。
+	//
+	// 三态，别用「空切片等于没配」去糊：
+	//   nil   —— 别动，Agent 保留自己的配置（Hub 关掉了这个开关）
+	//   []    —— 清回 Agent 自己的配置（用户把加速地址删光了）
+	//   [a,b] —— 整体替换成这个列表
+	// 合并两份列表的方案不可取：顺序决定了回退优先级，合起来那顺序没法解释。
+	Mirrors *[]string `json:"mirrors,omitempty"`
 }
 
 // Container 一条容器观测值。
@@ -210,6 +228,13 @@ type Cmd struct {
 
 	// upgrade 用：目标版本与（镜像方式安装时）要拉的目标镜像。
 	TargetVersion string `json:"target_version,omitempty"`
+
+	// config 用：要下发的镜像加速地址（整列表替换）。
+	//
+	// 用 nil 与空切片区分「没说」和「清空」：前者是别的指令顺手带来的零值，
+	// 后者是用户真的把加速地址删光了。混为一谈会让节点悄悄回退到内置默认源，
+	// 而页面上明明显示「已清空」。
+	Mirrors *[]string `json:"mirrors,omitempty"`
 }
 
 // Event 一次耗时操作的中间状态。

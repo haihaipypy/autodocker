@@ -495,6 +495,23 @@ main { padding: 20px 24px 48px; }
    早先用的是「内容决定宽度」，于是同一页里逐行读下来，
    「当前 / 可用 / 状态」会忽左忽右地错位，完全对不上表头。 */
 .cell.col-tag { flex: 0 0 96px; }
+/* 节点页按 compose 项目聚合那行，要放得下「9.4.7（pg 15.18）」：
+   组里版本不一致时得把少数派写出来，只写「多个版本」用户判断不了该不该动手。 */
+.cell.col-tag.tag-wide { flex: 0 0 138px; }
+/* 组内版本不一致时的写法（9.4.7（pg 15.18））：
+   cell-main 默认单行省略号，这里必须放开 —— 被截成「9.4.3（tengine 9.4.7…」
+   等于又变回一句没说清的话。 */
+.cell-main.tag-mixed {
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  /* 只在空格与顿号处折行：break-all 会把「15.18」劈成「15.1 / 8」，
+     版本号断成两截比截断更难读。 */
+  word-break: normal;
+  overflow-wrap: break-word;
+}
 .cell.col-kind { flex: 0 0 92px; }
 .cell.col-mode { flex: 0 0 116px; }
 .cell.col-src { flex: 0 0 84px; }
@@ -538,6 +555,36 @@ main { padding: 20px 24px 48px; }
   box-shadow: var(--shadow-lg);
 }
 .modal-card h3 { margin-bottom: 8px; font-size: 16px; }
+
+/* 删除节点的确认窗：左边字段名、右边值。Hub 地址之类的长串必须能换行，
+   否则整块被撑宽、弹窗里出现横向滚动条。 */
+.node-del-info {
+  margin: 14px 0 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.node-del-row {
+  display: flex;
+  gap: 12px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  border-bottom: 1px solid var(--border);
+}
+.node-del-row:last-child { border-bottom: none; }
+.node-del-row dt {
+  flex: 0 0 72px;
+  margin: 0;
+  color: var(--text-sub);
+}
+.node-del-row dd {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  word-break: break-all;
+}
 
 .clean-preview {
   margin-top: 14px;

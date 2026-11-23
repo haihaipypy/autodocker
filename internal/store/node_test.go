@@ -565,3 +565,83 @@ func TestMigrateAddsComposeDepsToBothTables(t *testing.T) {
 		t.Fatalf("监控项上的依赖没写对: %+v", imgs)
 	}
 }
+
+// 1.12.0 给 nodes 加了 offline_alert_at（同一次失联只报一次靠它）。
+//
+// 又一次踩「CREATE TABLE IF NOT EXISTS 不补列」这条：老库升上来必须走
+// ALTER TABLE，否则 Update 语句直接 no such column，整个失联告警全废。
+func TestMigrateAddsOfflineAlertAt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 1.11 时代的 nodes 表：没有 offline_alert_at。
+	for _, stmt := range []string{
+		`CREATE TABLE nodes (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL DEFAULT '',
+			hub_url TEXT NOT NULL DEFAULT '',
+			note TEXT NOT NULL DEFAULT '',
+			token_hash TEXT NOT NULL DEFAULT '',
+			hostname TEXT NOT NULL DEFAULT '',
+			os TEXT NOT NULL DEFAULT '',
+			arch TEXT NOT NULL DEFAULT '',
+			agent_version TEXT NOT NULL DEFAULT '',
+			protocol INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'never',
+			last_seen_at INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL DEFAULT 0
+		)`,
+		`INSERT INTO nodes (id, name, hub_url, token_hash, status) VALUES (1, 'waf', 'http://hub', 'h', 'online')`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			raw.Close()
+			t.Fatalf("造老库失败: %v", err)
+		}
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("老库升级失败: %v", err)
+	}
+	defer s.Close()
+
+	cols, err := s.tableColumns("nodes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cols["offline_alert_at"] {
+		t.Fatal("nodes 上没有 offline_alert_at，升级后告警逻辑会直接报错")
+	}
+
+	// 老数据读得回，记号是 0（还没报过）。
+	if at, err := s.NodeOfflineAlertAt(1); err != nil || at != 0 {
+		t.Fatalf("老节点应当读回 0，实际 at=%d err=%v", at, err)
+	}
+	if err := s.SetNodeOfflineAlert(1, 1700000000); err != nil {
+		t.Fatalf("写记号失败: %v", err)
+	}
+	if at, _ := s.NodeOfflineAlertAt(1); at != 1700000000 {
+		t.Errorf("记号没落盘，实际 %d", at)
+	}
+	if err := s.ClearNodeOfflineAlert(1); err != nil {
+		t.Fatalf("清记号失败: %v", err)
+	}
+	if at, _ := s.NodeOfflineAlertAt(1); at != 0 {
+		t.Errorf("清完应当是 0，实际 %d", at)
+	}
+
+	// 启动重置只动状态，不能把记号一起抹了 —— 同一次失联不该再报一遍。
+	if err := s.SetNodeOfflineAlert(1, 1700000000); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.TouchNode(1)
+	if err := s.MarkAllNodesOffline(); err != nil {
+		t.Fatalf("重置在线状态失败: %v", err)
+	}
+	if at, _ := s.NodeOfflineAlertAt(1); at != 1700000000 {
+		t.Errorf("重启后记号要留着，实际 %d", at)
+	}
+}

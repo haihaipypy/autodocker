@@ -149,6 +149,31 @@ func ParseReference(raw string) (Reference, error) {
 	}, nil
 }
 
+// IsImageID 判断一个「镜像引用」其实是不是镜像 ID。
+//
+// 容器的 Config.Image 里不一定存着仓库引用：用 docker run <镜像ID> 起的容器、
+// 或者在面板里按 ID 重建过，存的是一串十六进制 ID。这种值照样能被
+// ParseReference 解析成 library/c4d252255b7b:latest —— 语法上合法、语义上胡说，
+// 拿去查注册表必然「不存在」，而用户看到的是「所有镜像源均失败」，
+// 跟镜像源一点关系都没有。
+//
+// 只认裸的纯十六进制串（12~64 位，可带 sha256: 前缀）：带斜杠或冒号的值
+// 一律按引用处理 —— 把它误判成 ID 会让正常的镜像失去检测能力。
+func IsImageID(s string) bool {
+	s = strings.TrimPrefix(strings.TrimSpace(s), "sha256:")
+	if len(s) < 12 || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f', r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // normalizeHost 把用户写法归一化成实际 API 主机。
 func normalizeHost(host string) string {
 	switch host {

@@ -4,9 +4,14 @@ import (
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/haihaipypy/autodocker/internal/config"
 	"github.com/haihaipypy/autodocker/internal/dockerx"
+	"github.com/haihaipypy/autodocker/internal/model"
+	"github.com/haihaipypy/autodocker/internal/store"
 )
 
 // 「未使用镜像」这格的口径：按镜像 ID 去重、只要还有容器引用就不算。
@@ -131,5 +136,89 @@ func TestPushPathSkipsBasicAuthOnlyItself(t *testing.T) {
 		if rec.Code != c.want {
 			t.Errorf("%s auth=%v: 状态码 %d，期望 %d", c.path, c.auth, rec.Code, c.want)
 		}
+	}
+}
+
+// 1.12.0 两个新设置的默认值，以及「下发给节点」的三态。
+//
+// 老库升上来没有这两个字段。当成关闭的话，用户会莫名其妙既收不到失联告警、
+// 节点也不会跟着 Hub 换源 —— 两件都是「静默不工作」的类型，最难发现。
+func newSettingsServer(t *testing.T) (*Server, *store.Store) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatalf("打开库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return &Server{st: st, cfg: &config.Config{}}, st
+}
+
+func TestNodeSettingsDefaults(t *testing.T) {
+	s, _ := newSettingsServer(t)
+
+	on, after := s.NodeOfflineAlert()
+	if !on {
+		t.Error("失联告警默认应当开着")
+	}
+	if after != 10*time.Minute {
+		t.Errorf("默认阈值应为 10 分钟，实际 %v", after)
+	}
+
+	m := s.NodeMirrors()
+	if m == nil {
+		t.Fatal("默认应当下发（哪怕是空列表），实际是 nil 表示不下发")
+	}
+	if len(*m) != 0 {
+		t.Errorf("没填地址时应当下发空列表（让节点回到自己的配置），实际 %v", *m)
+	}
+}
+
+// 关掉开关就一个字节都不发：节点保留自己当前在用的源。
+func TestNodeMirrorsOffSendsNothing(t *testing.T) {
+	s, _ := newSettingsServer(t)
+	off := false
+	if err := s.saveSettings(model.Settings{RegistryMirror: "docker.1ms.run", NodeMirrorFollow: &off}); err != nil {
+		t.Fatal(err)
+	}
+	if m := s.NodeMirrors(); m != nil {
+		t.Fatalf("开关关着不该下发，实际 %v", *m)
+	}
+}
+
+// 开了就整体替换：顺序就是回退优先级，合并不接受。
+func TestNodeMirrorsSendsConfiguredList(t *testing.T) {
+	s, _ := newSettingsServer(t)
+	on := true
+	if err := s.saveSettings(model.Settings{
+		RegistryMirror: "docker.1ms.run, docker.xuanyuan.me", NodeMirrorFollow: &on,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m := s.NodeMirrors()
+	if m == nil || len(*m) != 2 {
+		t.Fatalf("应当下发两个地址，实际 %v", m)
+	}
+	if (*m)[0] != "docker.1ms.run" || (*m)[1] != "docker.xuanyuan.me" {
+		t.Errorf("顺序要保持配置里的先后，实际 %v", *m)
+	}
+}
+
+// 阈值低于下限就抬到 2 分钟：填 5 秒等于每轮心跳抖一下都告警。
+func TestNodeOfflineAfterClamped(t *testing.T) {
+	s, _ := newSettingsServer(t)
+	on := true
+	if err := s.saveSettings(model.Settings{NodeOfflineAlert: &on, NodeOfflineAfter: 1}); err != nil {
+		t.Fatal(err)
+	}
+	_, after := s.NodeOfflineAlert()
+	if after != 2*time.Minute {
+		t.Errorf("低于下限应抬到 2 分钟，实际 %v", after)
+	}
+
+	if err := s.saveSettings(model.Settings{NodeOfflineAlert: &on, NodeOfflineAfter: 30}); err != nil {
+		t.Fatal(err)
+	}
+	if _, after := s.NodeOfflineAlert(); after != 30*time.Minute {
+		t.Errorf("填 30 分钟应当照用，实际 %v", after)
 	}
 }

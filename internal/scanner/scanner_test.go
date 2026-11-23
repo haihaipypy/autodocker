@@ -466,3 +466,106 @@ func TestParseComposeDeps(t *testing.T) {
 		}
 	}
 }
+
+// 容器是用镜像 ID 起的时候，要知道该拿哪个仓库名去查更新。
+// 挑法必须稳定：同一台机器每轮挑中的得是同一个，否则「当前版本」那栏会来回跳。
+func TestPickImageRef(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		want string
+	}{
+		{
+			// 同一个镜像既有 latest 又有版本号：挑版本号，才看得到「上游出了新版」
+			name: "版本号优先于 latest",
+			in:   []string{"chaitin/safeline-mgt:latest", "chaitin/safeline-mgt:9.4.7"},
+			want: "chaitin/safeline-mgt:9.4.7",
+		},
+		{
+			// 迁移时留下的内部仓库地址排在后面：那多半是临时的
+			name: "Docker Hub 优先于其它注册表",
+			in:   []string{"myreg.local/app:9.4.7", "chaitin/app:latest"},
+			want: "chaitin/app:latest",
+		},
+		{
+			name: "只有内部仓库时仍然用它",
+			in:   []string{"ghcr.io/haihaipypy/autodocker:1.12.1"},
+			want: "ghcr.io/haihaipypy/autodocker:1.12.1",
+		},
+		{
+			name: "跳过悬空名",
+			in:   []string{"<none>:<none>", "nginx:1.25"},
+			want: "nginx:1.25",
+		},
+	}
+	for _, c := range cases {
+		got, ok := pickImageRef(c.in)
+		if !ok || got != c.want {
+			t.Errorf("%s: pickImageRef(%v) = %q,%v，期望 %q", c.name, c.in, got, ok, c.want)
+		}
+		// 顺序换一下结果必须一样：镜像身上的标签是按名字排的，不能靠运气
+		rev := append([]string(nil), c.in...)
+		for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
+			rev[i], rev[j] = rev[j], rev[i]
+		}
+		if got, _ := pickImageRef(rev); got != c.want {
+			t.Errorf("%s: 反序后 pickImageRef(%v) = %q，期望仍是 %q", c.name, rev, got, c.want)
+		}
+	}
+
+	if _, ok := pickImageRef(nil); ok {
+		t.Error("没有任何仓库名时应当返回 false，不能编一个假引用去查")
+	}
+	if _, ok := pickImageRef([]string{"<none>:<none>"}); ok {
+		t.Error("只有悬空名时应当返回 false")
+	}
+}
+
+// 「查不了」的原因必须说清是缺引用，而不是镜像源的问题 ——
+// 后者会让用户去换加速源，换多少次都没用。
+func TestUncheckableReasonPointsAtReference(t *testing.T) {
+	msg := uncheckableReason(dockerx.Container{Image: "c4d252255b7b"})
+	for _, want := range []string{"c4d252255b7b", "仓库名", "重跑"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("原因里缺少 %q：%s", want, msg)
+		}
+	}
+	if strings.Contains(msg, "镜像源") || strings.Contains(msg, "加速") {
+		t.Errorf("原因里不该提镜像源，会把人引偏：%s", msg)
+	}
+}
+
+// compose 起的容器要给一条能直接照抄的命令。
+//
+// 现场（safeline 的 mgt / detector）：镜像是被同标签新版本顶替掉的旧镜像，
+// RepoTags 与 RepoDigests 都是空的，本地再也找不回仓库名；容器标签里却有
+// 项目、服务名和工作目录。这时的正解是重建一次容器，而不是让用户去改引用 ——
+// 页面上根本没有改引用的地方。
+func TestUncheckableReasonGivesComposeCommand(t *testing.T) {
+	c := dockerx.Container{
+		Image: "sha256:c4d252255b7baef71ba426a83445fa162fa3d02a56ea399a3cdafbf488200e79",
+		Labels: map[string]string{
+			"com.docker.compose.service":             "mgt",
+			"com.docker.compose.project.working_dir": "/data/safeline",
+		},
+	}
+	msg := uncheckableReason(c)
+	for _, want := range []string{"/data/safeline", "docker compose up -d --force-recreate mgt"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("原因里缺少 %q：%s", want, msg)
+		}
+	}
+	// 这一行在页面上的显示宽度只有一百来个字符，命令本身必须落在前面，
+	// 否则会被截断成一个「docker compose up -d --force-…」这种没法用的东西。
+	if i, j := strings.Index(msg, "docker compose"), strings.Index(msg, "即可恢复检测"); i < 0 || j < 0 || i > j {
+		t.Errorf("命令应当完整出现在结论之前：%s", msg)
+	}
+
+	// 没有工作目录时不能编一个出来，只能说「compose 目录」。
+	msg = uncheckableReason(dockerx.Container{
+		Labels: map[string]string{"com.docker.compose.service": "mgt"},
+	})
+	if !strings.Contains(msg, "compose 目录") || strings.Contains(msg, "/data/") {
+		t.Errorf("缺少工作目录时应只说 compose 目录：%s", msg)
+	}
+}

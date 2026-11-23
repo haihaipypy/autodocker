@@ -190,6 +190,7 @@ func (s *Store) migrate() error {
 			status        TEXT    NOT NULL DEFAULT 'never',
 			last_seen_at  INTEGER NOT NULL DEFAULT 0,
 			last_report_at INTEGER NOT NULL DEFAULT 0,
+			offline_alert_at INTEGER NOT NULL DEFAULT 0,
 			created_at    INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_token ON nodes(token_hash)`,
@@ -330,6 +331,11 @@ func (s *Store) addTaskColumns() error {
 // 「在线但还没收到过快照」要显示成巡检中，而不是一个会误导人的 0。
 var nodeAddedColumns = []struct{ name, ddl string }{
 	{"last_report_at", "INTEGER NOT NULL DEFAULT 0"},
+	// 1.12.0：本次失联发过告警的时刻，0 表示还没报过。
+	//
+	// 落库而不是只放内存：Hub 重启后同一次失联仍然是同一次，
+	// 不能因为「重启了一遍」就再报一遍。
+	{"offline_alert_at", "INTEGER NOT NULL DEFAULT 0"},
 }
 
 // nodeContainerAddedColumns 是 1.10.0 起为 node_containers 表新增的列。

@@ -216,6 +216,20 @@ func (u *Updater) Run(ctx context.Context, req Request) error {
 	}
 	logf("镜像拉取完成")
 
+	// compose 项目里固定版本的是文件（或它读的 .env），而我们重建容器不经过 compose。
+	// 只换容器不改文件，下一次 docker compose up -d 就会把刚升上去的容器退回去 ——
+	// safeline 那台从 9.4.7 掉回 9.4.3 正是这么来的。
+	// 改不动的场合只记一行警告：文件不该拦住更新本身。
+	compose := u.syncComposeTag(ctx, insp, req.ImageRef, logf)
+	defer compose.Close()
+	failAfterCompose := func(err error) error {
+		if compose != nil {
+			compose.Undo()
+			logf("已把 compose 项目里的版本改回原样")
+		}
+		return fail(err)
+	}
+
 	// 容器已经在跑目标镜像：重建只是白停一次服务、白断一次连接。
 	// 正常路径走不到这里，只有「上次重建成功但状态没写回」这类历史数据会撞上 ——
 	// 那时点更新，容器其实早就是新版了。比的是镜像编号，不是引用字符串：
@@ -231,7 +245,7 @@ func (u *Updater) Run(ctx context.Context, req Request) error {
 	if wasRunning {
 		logf("停止旧容器")
 		if err := u.dk.StopContainer(ctx, req.ContainerID, opt.StopTimeoutSec); err != nil {
-			return fail(err)
+			return failAfterCompose(err)
 		}
 	}
 
@@ -240,7 +254,7 @@ func (u *Updater) Run(ctx context.Context, req Request) error {
 		if wasRunning {
 			_ = u.dk.StartContainer(ctx, req.ContainerID)
 		}
-		return fail(err)
+		return failAfterCompose(err)
 	}
 	logf("旧容器已重命名为 %s", backupName)
 
@@ -249,14 +263,14 @@ func (u *Updater) Run(ctx context.Context, req Request) error {
 	if err != nil {
 		logf("创建新容器失败，开始回滚")
 		u.rollback(ctx, "", req.ContainerID, origName, wasRunning, logf)
-		return fail(err)
+		return failAfterCompose(err)
 	}
 	logf("新容器已创建 %s", shortID(newID))
 
 	if err := u.dk.StartContainer(ctx, newID); err != nil {
 		logf("启动新容器失败，开始回滚")
 		u.rollback(ctx, newID, req.ContainerID, origName, wasRunning, logf)
-		return fail(err)
+		return failAfterCompose(err)
 	}
 
 	// 健康检查：确认新容器真的活了再清理旧容器
@@ -268,6 +282,10 @@ func (u *Updater) Run(ctx context.Context, req Request) error {
 				logf("健康检查未通过（%s），执行回滚", msg)
 				u.rollback(ctx, newID, req.ContainerID, origName, wasRunning, logf)
 				_ = u.st.FinishTask(req.TaskID, model.TaskRolledBack, "", msg)
+				if compose != nil {
+					compose.Undo()
+					logf("已把 compose 项目里的版本改回原样")
+				}
 				return errors.New(msg)
 			}
 			logf("健康检查未通过（%s），但已关闭自动回滚，保留新容器", msg)

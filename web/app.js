@@ -41,6 +41,9 @@ const state = {
   nodeUpgrading: new Set(),
   nodeUpgradeLast: {},
   hubVersion: '',
+  // 删除确认窗里正在等确认的节点 id。弹窗里的「确认删除」拿它下发请求，
+  // 不靠 DOM 里藏 id —— 卡片重渲染时节点行会被整段换掉。
+  nodeDelID: null,
 };
 
 /* ---------- 登录态 ---------- */
@@ -916,6 +919,58 @@ function batchFailText(b) {
   return `${b.failed} 更新失败：${raw}`;
 }
 
+// shortContainerName 去掉容器名前面的项目名。
+//
+// 组标题已经写着 safeline 了，括号里再写一遍 safeline-pg 只会把这一格撑爆。
+function shortContainerName(name, project) {
+  if (!name) return '';
+  for (const sep of ['-', '_']) {
+    const prefix = project + sep;
+    if (project && name.startsWith(prefix)) return name.slice(prefix.length);
+  }
+  return name;
+}
+
+// groupTags 拼出「当前」那一格的版本。
+//
+// 以前版本不一致就只写「多个版本」—— 等于没说：用户看不出谁是少数派，
+// 也判断不了该不该动手。而实际情形常常是两套彼此无关的版本线
+// （safeline 的 pg 是 15.x，其余组件是 9.x），那本来就不是「有问题」。
+// 取出现最多的当主版本，其余挂在括号里。名字写全会把这一格撑成三行，
+// 超过一行半就只留版本号 —— 谁在哪个版本上，左边那行容器清单与悬停提示里查得到。
+function groupTags(members, project) {
+  const tags = [...new Set(members.map((m) => m.local_tag).filter(Boolean))];
+  if (!tags.length) return { text: '—', title: '' };
+  if (tags.length === 1) return { text: tags[0], title: '' };
+
+  const byTag = new Map();
+  for (const m of members) {
+    if (!m.local_tag) continue;
+    if (!byTag.has(m.local_tag)) byTag.set(m.local_tag, []);
+    byTag.get(m.local_tag).push(shortContainerName(m.container_name, project));
+  }
+  // 出现最多的当主版本；打平时取先出现的那个，保证同一份数据每轮渲染都一样。
+  let main = tags[0];
+  for (const [t, names] of byTag) {
+    if (names.length > byTag.get(main).length) main = t;
+  }
+
+  const detailed = [];
+  const plain = [];
+  for (const [t, names] of byTag) {
+    if (t === main) continue;
+    plain.push(t);
+    detailed.push(names.length === 1 ? `${names[0]} ${t}` : `${names[0]} 等 ${names.length} 个 ${t}`);
+  }
+  const detail = detailed.join('、').length <= 24
+    ? detailed.join('、')
+    : `另有 ${plain.slice(0, 3).join('、')}${plain.length > 3 ? ` 等 ${plain.length} 种` : ''}`;
+  return {
+    text: `${main}（${detail}）`,
+    title: members.map((m) => `${m.container_name} ${m.local_tag || '—'}`).join('\n'),
+  };
+}
+
 // nodeProjectRow 一个 compose 项目一行，一个按钮更新整个项目。
 //
 // 「可用」那一格只在所有成员的目标版本一致时才写 tag —— 版本各不相同的时候
@@ -923,7 +978,7 @@ function batchFailText(b) {
 function nodeProjectRow(g, node, op, batch) {
   const members = g.members;
   const pending = members.filter(hasUpdate);
-  const tags = [...new Set(members.map((m) => m.local_tag).filter(Boolean))];
+  const tagCell = groupTags(members, g.project);
   const targets = [...new Set(pending.map((m) => m.latest_tag || '内容已更新'))];
   const mine = batch && batch.project === g.project ? batch : null;
   const runningHere = !!(mine && mine.running);
@@ -976,11 +1031,11 @@ function nodeProjectRow(g, node, op, batch) {
         <div class="cell-sub">${members.map((m) => esc(m.container_name)).join(' · ')}</div>
         ${failLine}${errLine}
       </div>
-      <div class="cell col-tag">
+      <div class="cell col-tag tag-wide">
         <div class="cell-sub">当前</div>
-        <div class="cell-main mono">${esc(tags.length === 1 ? tags[0] : (tags.length ? '多个版本' : '—'))}</div>
+        <div class="cell-main mono${tagCell.title ? ' tag-mixed' : ''}"${tagCell.title ? ` title="${esc(tagCell.title)}"` : ''}>${esc(tagCell.text)}</div>
       </div>
-      <div class="cell col-tag">
+      <div class="cell col-tag tag-wide">
         <div class="cell-sub">可用</div>
         <div class="cell-main mono">${esc(avail)}</div>
       </div>
@@ -1307,18 +1362,100 @@ async function rotateNodeToken(id) {
   }
 }
 
-async function deleteNode(id) {
+// UNINSTALL_CMD 目标机上卸载 Agent 的命令。
+//
+// 与文档、README 里给的那条保持一致：容器删掉，数据卷一起删 ——
+// 只删容器会留下带令牌的卷，下次用同一个卷起回来还是旧身份，
+// 用户在 Hub 里删掉的节点会以「又连上来了」的形式复活。
+const UNINSTALL_CMD = 'docker rm -f autodocker-agent && docker volume rm autodocker-agent-data';
+
+// openNodeDelModal 删除节点前的确认窗。
+//
+// 浏览器的 confirm 只放得下一句话：既说不清「删掉之后目标机上还剩什么」，
+// 也放不下那条卸载命令 —— 用户要复制还得自己去文档里翻。删节点是不可逆的
+// （令牌当场作废，要让机器回来得重新添加），值得把这几件事一次交代清楚。
+function openNodeDelModal(id) {
   const n = state.nodes.find((x) => x.id === id);
-  if (!confirm(`删除节点「${n ? n.name : ''}」？目标机上的 Agent 容器不会自动卸载。`)) return;
+  if (!n) return;
+  const box = $('#node-del-body');
+  if (!box) return;
+  state.nodeDelID = id;
+
+  const st = NODE_STATUS[n.status] || NODE_STATUS.never;
+  const rows = [
+    ['状态', `<span class="badge ${st.cls}">${st.text}</span>`],
+    ['主机', esc([n.hostname, n.os, n.arch].filter(Boolean).join(' · ') || '尚未上报')],
+    ['Agent', esc(n.agent_version || '尚未上报')],
+    ['Hub 地址', `<span class="mono">${esc(n.hub_url || '—')}</span>`],
+    ['容器', `${n.container_count || 0} 个${n.update_count ? ` · 待更新 ${n.update_count}` : ''}`],
+    ['最后心跳', hasTime(n.last_seen_at) ? fmtTime(n.last_seen_at) : '—'],
+    ['添加时间', hasTime(n.created_at) ? fmtTime(n.created_at) : '—'],
+  ];
+  if (n.note) rows.push(['备注', esc(n.note)]);
+
+  box.innerHTML = `
+    <h3>删除节点「${esc(n.name || '未命名节点')}」</h3>
+    <p class="field-hint">
+      这里删掉的是 Hub 侧的记录和巡检数据。目标机上的 Agent 不受影响、会一直尝试重连，
+      要一起清掉就在那台机器上执行下面这条命令。
+    </p>
+    <dl class="node-del-info">
+      ${rows.map(([k, v]) => `<div class="node-del-row"><dt>${k}</dt><dd>${v}</dd></div>`).join('')}
+    </dl>
+    <div class="field-hint" style="margin:16px 0 6px">在目标机上执行（停掉并删除 Agent 与它的数据卷）：</div>
+    <pre class="node-cmd">${esc(UNINSTALL_CMD)}</pre>
+    <button type="button" class="btn small" data-copy-uninstall>复制命令</button>
+    <p class="field-hint" style="margin-top:14px">
+      窗口关掉后这条命令就找不到了，需要先复制再删。删掉之后这个节点的令牌立刻作废，
+      要让这台机器回来得重新添加节点、重新执行安装命令。
+    </p>
+    <div class="form-actions">
+      <button type="button" class="btn danger" id="btn-node-del-ok">确认删除</button>
+      <button type="button" class="btn ghost" data-close-modal="1">取消</button>
+    </div>`;
+  $('#node-del-modal').hidden = false;
+}
+
+function closeNodeDelModal() {
+  const modal = $('#node-del-modal');
+  if (modal) modal.hidden = true;
+  state.nodeDelID = null;
+  const box = $('#node-del-body');
+  if (box) box.innerHTML = '';
+}
+
+// confirmNodeDel 真正下发删除。
+//
+// 失败时把按钮放开并留在弹窗里：关掉弹窗再重来一次，用户还得重新找一遍这个节点。
+async function confirmNodeDel() {
+  const id = state.nodeDelID;
+  if (id === null || id === undefined) return;
+  const btn = $('#btn-node-del-ok');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '删除中…';
+  }
   try {
     await api(`/api/nodes/${id}`, { method: 'DELETE' });
     state.nodeOpen.delete(id);
     state.nodeErr.delete(id);
+    closeNodeDelModal();
     toast('已删除');
     await loadNodes();
   } catch (e) {
     toast('删除失败：' + e.message, 'danger');
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '确认删除';
+    }
   }
+}
+
+async function copyUninstallCmd() {
+  const pre = $('#node-del-body .node-cmd');
+  if (!pre) return;
+  const ok = await copyText(pre.textContent);
+  toast(ok ? '卸载命令已复制' : '复制失败，请手动选中命令', ok ? 'ok' : 'warn');
 }
 
 // 通知渠道清单。
@@ -1992,11 +2129,11 @@ function renderSettings() {
     <div class="field">
       <label for="registry_mirror">镜像加速地址（可填多个）</label>
       <input id="registry_mirror" name="registry_mirror" type="text" value="${esc(s.registry_mirror)}"
-             placeholder="例如 docker.1ms.run, docker.xuanyuan.me">
+             placeholder="例如 docker.1ms.run, docker.1panel.live">
       <p class="field-hint">
         多个地址用逗号分隔，按顺序回退，全部失败才走直连。仅作用于 <b>Docker Hub</b>；
         ghcr.io / quay.io / 私有仓库仍直连，不会被带偏。留空则先沿用 Docker 守护进程已配的加速器，
-        仍为空时使用内置默认（<code>docker.1ms.run</code> / <code>docker.xuanyuan.me</code>）。
+        仍为空时使用内置默认（<code>docker.1ms.run</code> / <code>docker.1panel.live</code>）。
       </p>
     </div>
     <div class="field">
@@ -2069,6 +2206,33 @@ function renderSettings() {
       停一次容器、按原配置重建，约 10 秒回到线上。关掉就只能在这一页手动点「升级 Agent」。
       两版之前装的 Agent 不认识升级指令，需要在目标机上重跑一次安装命令；升上来之后就不用了。
     </p>
+
+    <label class="check">
+      <input type="checkbox" id="node_mirror_follow" ${s.node_mirror_follow ? 'checked' : ''}>
+      把上面的镜像加速地址下发给所有节点
+    </label>
+    <p class="field-hint">
+      节点的检测由 Agent 自己发请求，不经过 Docker 守护进程，所以它用不上那台机器
+      <code>daemon.json</code> 里的加速器 —— 表现就是宿主机拉得动镜像、节点页却整列「检测异常」。
+      开着（默认）之后，保存就会推给在线节点，下一次巡检改用新的源；这一格留空则让节点
+      回到它自己的配置。节点要升到 1.12.0 才认这条指令，没升级的会静默跳过。
+    </p>
+
+    <label class="check">
+      <input type="checkbox" id="node_offline_alert" ${s.node_offline_alert ? 'checked' : ''}>
+      节点失联时推送一条消息
+    </label>
+    <div class="field">
+      <label for="node_offline_after">失联多久后推送（分钟）</label>
+      <input id="node_offline_after" name="node_offline_after" type="number" min="2" max="1440"
+             value="${esc(String(s.node_offline_after || 10))}">
+      <p class="field-hint">
+        判定分两层：连接断开 90 秒（三次心跳没回应）就在页面上标离线；超过这里填的时间
+        才推消息。默认 10 分钟，短于 2 分钟按 2 分钟算 —— 节点自动升级要重建一次容器，
+        那几十秒的断线是计划内的。同一次失联只推一条，节点回来时会补一条「已恢复」。
+        全部节点同时失联只推一条汇总，因为那多半是本机网络的问题。
+      </p>
+    </div>
 
     <h3 class="form-section">关于</h3>
     <div class="about">
@@ -2603,6 +2767,17 @@ async function openTaskLog(id) {
   }
 }
 
+// offlineAfterMinutes 读「失联多久后推送」，把非法值收敛到 2~1440 分钟。
+//
+// 输入框允许留空、也允许手打 0；直接原样送上去会被后端拒掉，
+// 用户只看到一句「保存失败」，却不知道是哪一格的问题。
+function offlineAfterMinutes() {
+  const el = $('#node_offline_after');
+  const n = parseInt(el ? el.value : '10', 10);
+  if (!Number.isFinite(n)) return 10;
+  return Math.min(1440, Math.max(2, n));
+}
+
 // settingsPayload 把当前表单收集成一份完整设置。
 //
 // 切换渠道会整块重绘表单，没显示的那一组输入已不在 DOM 里。
@@ -2639,6 +2814,10 @@ function settingsPayload() {
     // 自检开关每次都要带上，否则保存一次设置就把用户关掉的检查又打开了
     check_updates: $('#check_updates') ? $('#check_updates').checked : true,
     agent_auto_upgrade: $('#agent_auto_upgrade') ? $('#agent_auto_upgrade').checked : true,
+    // 远程节点的两个新开关：默认开，页面上没有这两个控件时（老页面残留）也不能丢。
+    node_mirror_follow: $('#node_mirror_follow') ? $('#node_mirror_follow').checked : true,
+    node_offline_alert: $('#node_offline_alert') ? $('#node_offline_alert').checked : true,
+    node_offline_after: offlineAfterMinutes(),
     // 这两个也是「留空即直连」，所以空串要如实回传，不能丢字段
     selfcheck_proxy: ($('#selfcheck_proxy') ? $('#selfcheck_proxy').value : '').trim(),
     selfcheck_mirror: ($('#selfcheck_mirror') ? $('#selfcheck_mirror').value : '').trim(),
@@ -2686,16 +2865,24 @@ async function saveSettings(ev) {
   renderSettings();
 
   const mirrorChanged = (prev.registry_mirror || '') !== payload.registry_mirror;
+  // 加速地址变了、又开着「下发给节点」，那就别只说「本机生效」——
+  // 用户改这个格子十有八九就是为了让节点也用上，说清楚已经推过去了。
+  const followOn = payload.node_mirror_follow !== false;
+  const mirrorSaved = mirrorChanged
+    ? (followOn
+      ? '已保存，加速地址已发给在线节点，下次巡检就用新的源'
+      : '已保存，加速地址已生效，点「立即扫描」验证')
+    : '';
   // 代理/前缀刚改完，用户要的就是「检查更新能不能通」。顺手在后台试一次，
   // 免得他保存完还得多点一下才知道填对没填对。
   const netChanged = (prev.selfcheck_proxy || '') !== payload.selfcheck_proxy
     || (prev.selfcheck_mirror || '') !== payload.selfcheck_mirror;
   if (netChanged) {
     reconnectSelfCheck();
-    toast(mirrorChanged ? '已保存，加速地址已生效，点「立即扫描」验证' : '已保存，正在用新配置试一次检查更新…');
+    toast(mirrorSaved || '已保存，正在用新配置试一次检查更新…');
     return;
   }
-  toast(mirrorChanged ? '已保存，加速地址已生效，点「立即扫描」验证' : '设置已保存并生效');
+  toast(mirrorSaved || '设置已保存并生效');
 }
 
 // reconnectSelfCheck 换了 GitHub 连接方式后静默试一次，结果落在「关于」那一行。
@@ -3173,7 +3360,7 @@ function renderRegistryTest(res) {  const rows = (res.results || []).map((r) => 
   const allBad = (res.results || []).length > 0 && res.results.every((r) => !r.ok);
   const advice = allBad
     ? `<p class="field-hint warn-text">全部不通。若网络能正常上网，多半是 Docker Hub 在国内不可达，
-       请在上一栏填入可用的加速地址（例如 <code>docker.1ms.run</code> 或 <code>docker.xuanyuan.me</code>）后重试。</p>`
+       请在上一栏填入可用的加速地址（例如 <code>docker.1ms.run</code> 或 <code>docker.1panel.live</code>）后重试。</p>`
     : '';
 
   return `
@@ -3308,6 +3495,7 @@ document.addEventListener('click', async (ev) => {
   if (ev.target.closest('[data-close-modal]')) {
     closeCleanModal();
     closeUpdateModal();
+    closeNodeDelModal();
     return;
   }
 
@@ -3337,7 +3525,10 @@ document.addEventListener('click', async (ev) => {
   if (nTok) { rotateNodeToken(Number(nTok.dataset.nodeToken)); return; }
 
   const nDel = ev.target.closest('[data-node-del]');
-  if (nDel) { deleteNode(Number(nDel.dataset.nodeDel)); return; }
+  if (nDel) { openNodeDelModal(Number(nDel.dataset.nodeDel)); return; }
+
+  if (ev.target.id === 'btn-node-del-ok') { confirmNodeDel(); return; }
+  if (ev.target.closest('[data-copy-uninstall]')) { copyUninstallCmd(); return; }
 
   if (ev.target.closest('[data-copy-node-cmd]')) {
     copyNodeCommand();

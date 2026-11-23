@@ -194,10 +194,49 @@ func (s *Store) MarkNodeOffline(id int64) error {
 }
 
 // MarkAllNodesOffline 启动时调用：进程重启后旧的「在线」状态全部作废。
+//
+// 只改状态，**不动** offline_alert_at：那是「这次失联已经告诉过用户了」的记号。
+// 一次失联只报一次，直到节点真的回来才清 —— Hub 自己重启不该让同一次失联
+// 再报一遍，用户收到两条一模一样的「节点离线」只会以为出了新问题。
 func (s *Store) MarkAllNodesOffline() error {
 	_, err := s.db.Exec(
 		`UPDATE nodes SET status = ? WHERE status = ?`, model.NodeOffline, model.NodeOnline,
 	)
+	return err
+}
+
+// SetNodeLastSeen 直接改「最后一次联系」的时间。
+//
+// 正常路径由心跳与上报刷新，这里是留给「造历史数据」的：迁移旧库、
+// 复现失联场景、测试里模拟一台两小时没回应的机器。生产代码不该在
+// 心跳之外的地方调用它 —— 两个写入点会让这个时间戳变得不可信。
+func (s *Store) SetNodeLastSeen(id int64, at time.Time) error {
+	_, err := s.db.Exec(`UPDATE nodes SET last_seen_at = ? WHERE id = ?`, at.Unix(), id)
+	return err
+}
+
+// NodeOfflineAlertAt 返回本次失联已经报过警的时刻，0 表示还没报。
+func (s *Store) NodeOfflineAlertAt(id int64) (int64, error) {
+	var at sql.NullInt64
+	err := s.db.QueryRow(`SELECT offline_alert_at FROM nodes WHERE id = ?`, id).Scan(&at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	return at.Int64, nil
+}
+
+// SetNodeOfflineAlert 记下「这次失联已经报过了」。
+func (s *Store) SetNodeOfflineAlert(id int64, at int64) error {
+	_, err := s.db.Exec(`UPDATE nodes SET offline_alert_at = ? WHERE id = ?`, at, id)
+	return err
+}
+
+// ClearNodeOfflineAlert 节点回来了，把失联记号清掉。
+func (s *Store) ClearNodeOfflineAlert(id int64) error {
+	_, err := s.db.Exec(`UPDATE nodes SET offline_alert_at = 0 WHERE id = ?`, id)
 	return err
 }
 

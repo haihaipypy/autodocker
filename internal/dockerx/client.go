@@ -408,17 +408,27 @@ func (c *Client) State(ctx context.Context, id string) (running bool, health, st
 
 // ---- 镜像操作 ----
 
-// ImageRepoDigests 返回某个镜像的仓库摘要列表（形如 nginx@sha256:...）。
-func (c *Client) ImageRepoDigests(ctx context.Context, refOrID string) ([]string, error) {
+// ImageNames 返回镜像身上登记的仓库名与摘要引用。
+//
+// 传镜像 ID（sha256:… 或短 ID）也能查。两个列表都可能为空：悬空镜像没有任何
+// 仓库名，用 docker build / docker commit 出来的镜像也一样 —— 这时「它对应
+// 哪个仓库」在本地已经无从得知，只能如实告诉用户查不了。
+func (c *Client) ImageNames(ctx context.Context, idOrRef string) (tags, digests []string, err error) {
 	var payload struct {
 		RepoDigests []string `json:"RepoDigests"`
 		RepoTags    []string `json:"RepoTags"`
 	}
-	path := "/images/" + url.PathEscape(refOrID) + "/json"
+	path := "/images/" + url.PathEscape(idOrRef) + "/json"
 	if err := c.doJSON(ctx, http.MethodGet, path, nil, &payload); err != nil {
-		return nil, fmt.Errorf("读取镜像详情失败: %w", err)
+		return nil, nil, fmt.Errorf("读取镜像详情失败: %w", err)
 	}
-	return payload.RepoDigests, nil
+	return payload.RepoTags, payload.RepoDigests, nil
+}
+
+// ImageRepoDigests 返回某个镜像的仓库摘要列表（形如 nginx@sha256:...）。
+func (c *Client) ImageRepoDigests(ctx context.Context, refOrID string) ([]string, error) {
+	_, digests, err := c.ImageNames(ctx, refOrID)
+	return digests, err
 }
 
 // DigestForImage 从 RepoDigests 中挑出与指定引用匹配的那一条摘要。

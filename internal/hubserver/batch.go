@@ -181,7 +181,7 @@ func (s *Server) runBatch(nodeID int64, items []model.NodeContainer) {
 			s.failMember(nodeID, it.ContainerName, preloadFailText(err))
 			return
 		}
-		if err := s.waitMember(nodeID, it.ContainerName, started); err != nil {
+		if err := s.waitMember(nodeID, it, started); err != nil {
 			s.failMember(nodeID, it.ContainerName, preloadFailText(err))
 			return
 		}
@@ -206,7 +206,7 @@ func (s *Server) runBatch(nodeID int64, items []model.NodeContainer) {
 			s.failMember(nodeID, it.ContainerName, err.Error())
 			return
 		}
-		if err := s.waitMember(nodeID, it.ContainerName, started); err != nil {
+		if err := s.waitMember(nodeID, it, started); err != nil {
 			s.failMember(nodeID, it.ContainerName, err.Error())
 			return
 		}
@@ -222,35 +222,56 @@ func (s *Server) runBatch(nodeID int64, items []model.NodeContainer) {
 
 // waitMember 等一个成员跑出结果。started 是下发这条指令之前取的时刻。
 //
-// 只认「下发之后」产生的结果：完成态会留 90 秒，紧接着等下一个成员时
-// 上次那份 done 还挂在那儿，拿它当结果会把没跑的当成跑完了。
-// updatedAt 也必须是 !Before，不能写 After —— Windows 的时间精度粗到十几毫秒，
+// 只认「这个成员自己」的结果：完成态会留 90 秒，紧接着等下一个成员时，
+// 上一个成员的 done 还挂在那儿；光靠时间戳挡不住 —— `updatedAt` 与 `started`
+// 落在同一个时钟刻度里时（Windows 上十几毫秒一格都可能），那条旧结果会被
+// 当成新成员的进度。预拉阶段这么错一次，就是把「tengine 拉不到」读成
+// 「拉好了」，然后整批照常重建 —— 恰恰是「先全拉再重建」最不能出错的地方。
+// 所以先按容器编号（拿不到再按名字）认人，再看时间。
+//
+// updatedAt 只能用 !Before，不能写 After —— Windows 的时间精度粗到十几毫秒，
 // 下发与事件同刻度时 After 为 false，整批就永远卡在那里等。
-func (s *Server) waitMember(nodeID int64, name string, started time.Time) error {
+func (s *Server) waitMember(nodeID int64, it model.NodeContainer, started time.Time) error {
+	name := it.ContainerName
 	deadline := started.Add(memberTimeout)
 	idle := started
 	for {
 		if !time.Now().Before(deadline) {
 			return fmt.Errorf("%s 等了 %d 分钟还没跑完，已放弃等待", name, int(memberTimeout.Minutes()))
 		}
-		phase, msg, updatedAt := s.OpResult(nodeID)
-		if !updatedAt.IsZero() && !updatedAt.Before(started) {
-			switch phase {
-			case hubproto.PhaseDone:
-				return nil
-			case hubproto.PhaseFailed:
-				if msg == "" {
-					msg = "更新失败"
+		if op := s.Op(nodeID); op != nil && isOwnResult(op, it) {
+			phase, msg, updatedAt := op.Phase, op.Message, op.UpdatedAt
+			if !updatedAt.IsZero() && !updatedAt.Before(started) {
+				switch phase {
+				case hubproto.PhaseDone:
+					return nil
+				case hubproto.PhaseFailed:
+					if msg == "" {
+						msg = "更新失败"
+					}
+					return errors.New(msg)
 				}
-				return errors.New(msg)
+				// 只有「这一轮之后」的进度才能把静默计时清零：
+				// 上一次留下的完成态若也算数，卡住的成员就永远等不到超时。
+				idle = time.Now()
 			}
-			idle = time.Now()
 		}
 		if time.Since(idle) > memberIdle {
 			return fmt.Errorf("%s 更新中，节点 %d 秒没有回传进度", name, int(memberIdle.Seconds()))
 		}
 		time.Sleep(time.Second)
 	}
+}
+
+// isOwnResult 这条操作状态是不是属于这一批里的这个成员。
+//
+// 编号比名字可靠：容器改名之后 Hub 快照里的名字与 Agent 回传的可能不同，
+// 但容器编号不会变。两边都有编号时必须相等，都没有才退回去比名字。
+func isOwnResult(op *OpState, it model.NodeContainer) bool {
+	if op.ContainerID != "" && it.ContainerID != "" {
+		return op.ContainerID == it.ContainerID
+	}
+	return op.ContainerName != "" && op.ContainerName == it.ContainerName
 }
 
 // preloadFailText 预拉阶段没成功时写进批次状态的那句话。

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -165,7 +166,36 @@ func run() error {
 			srv := settingsOwner.Load()
 			return srv != nil && srv.AgentAutoUpgrade()
 		},
+		// 加速地址与失联告警都从设置页现读：改完立刻生效，不用重启。
+		// 同样走 atomic 指针，因为 api.Server 是后面才建的。
+		Mirrors: func() *[]string {
+			srv := settingsOwner.Load()
+			if srv == nil {
+				return nil // 页面还没建好：别动节点现有的配置
+			}
+			return srv.NodeMirrors()
+		},
+		OfflineAlert: func() (bool, time.Duration) {
+			srv := settingsOwner.Load()
+			if srv == nil {
+				return false, 0
+			}
+			return srv.NodeOfflineAlert()
+		},
+		PushText: func(pctx context.Context, title, body string) {
+			if _, err := nt.Push(pctx, notify.PushRequest{Title: title, Body: body}); err != nil {
+				// 没配任何渠道时这里必然失败，属于正常情况；
+				// 告警本身已经写进日志，页面上的节点状态也照样会变。
+				logger.Debug("节点告警未能推送", "title", title, "err", err)
+			}
+		},
 	}, st, logger)
+	// 进程重启后上一轮的「在线」不再成立：节点会重连，但页面不该在那之前
+	// 显示一片绿。只改状态，不动失联记号 —— 同一次失联不重复报警。
+	if err := st.MarkAllNodesOffline(); err != nil {
+		logger.Warn("重置节点在线状态失败", "err", err)
+	}
+	go hubsrv.WatchOffline(ctx)
 	// 反过来把节点通道交给通知服务：卡片上点「更新」时才知道往哪台机器发指令。
 	nt.SetRemoteNodes(hubsrv)
 
@@ -355,6 +385,18 @@ func runAgent(ctx context.Context, cfg *config.Config, logger *slog.Logger,
 		}
 	}
 
+	// 上一次 Hub 下发过的加速源先顶上：节点重启后、握手完成前也可能先扫一轮，
+	// 那几秒不该退回内置默认（国内的机器退回默认基本等于整列「未知」）。
+	// Hub 连上后会再下发一次，相同就不重复应用。
+	initialMirrors := registry.ParseMirrors(cfg.RegistryMirror)
+	if raw, ok, err := st.GetSetting(hub.MirrorsSettingKey); err == nil && ok && raw != "" {
+		var saved []string
+		if json.Unmarshal([]byte(raw), &saved) == nil && len(saved) > 0 {
+			initialMirrors = saved
+			logger.Info("沿用上次下发的镜像加速地址", "mirrors", strings.Join(saved, ","))
+		}
+	}
+
 	hc := hub.New(hub.Config{
 		HubURL:          cfg.HubURL,
 		Token:           cfg.NodeToken,
@@ -363,6 +405,17 @@ func runAgent(ctx context.Context, cfg *config.Config, logger *slog.Logger,
 		ScanInterval:    cfg.ScanInterval,
 		SelfContainer:   cfg.SelfContainer,
 		SelfContainerID: cfg.SelfContainerID,
+		BaseMirrors:     registry.ParseMirrors(cfg.RegistryMirror),
+		InitialMirrors:  initialMirrors,
+		// Hub 说「用这些」就整体替换；说「清空」就回到 baseMirrors。
+		// 两条路都要落到同一个客户端上，检测才真的会换源。
+		OnMirrors: func(list []string) {
+			reg.SetOptions(registry.Options{
+				Mirrors:  list,
+				Insecure: cfg.RegistryInsecure,
+				Auth:     cfg.RegistryAuth,
+			})
+		},
 	}, sc, st, dk, up, logger, ring)
 	if upgradeRes != nil {
 		hc.SetUpgradeResult(&hubproto.UpgradeResult{
